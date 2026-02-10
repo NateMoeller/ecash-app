@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::bail;
 use anyhow::Context;
+use bitcoin::hashes::{sha256, Hash};
 use bitcoin::key::rand::{seq::SliceRandom, thread_rng};
 use fedimint_bip39::{Bip39RootSecretStrategy, Language, Mnemonic};
 use fedimint_client::{
@@ -66,7 +67,8 @@ use crate::{
         BitcoinDisplay, BitcoinDisplayKey, BtcPrice, BtcPriceKey, BtcPrices, BtcPricesKey,
         Connector, ContactSyncConfigKey, FederationBackupKey, FederationMetaKey,
         FederationMetaKeyPrefix, FiatCurrency, FiatCurrencyKey, LightningAddressConfig,
-        LightningAddressKey, LightningAddressKeyPrefix, SchemaVersionKey,
+        LightningAddressKey, LightningAddressKeyPrefix, PinCodeHashKey,
+        RequirePinForSpendingKey, SchemaVersionKey,
     },
     error_to_flutter, get_nostr_client, info_to_flutter, FederationConfig, FederationConfigKey,
     FederationConfigKeyPrefix, SeedPhraseAckKey,
@@ -3855,6 +3857,54 @@ impl Multimint {
             &crate::db::FederationOrder { order },
         )
         .await;
+        dbtx.commit_tx().await;
+    }
+
+    pub async fn has_pin_code(&self) -> bool {
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        dbtx.get_value(&PinCodeHashKey).await.is_some()
+    }
+
+    pub async fn set_pin_hash(&self, pin: String) -> anyhow::Result<()> {
+        if pin.len() < 4 || pin.len() > 6 || !pin.chars().all(|c| c.is_ascii_digit()) {
+            bail!("PIN must be 4-6 digits");
+        }
+        let hash = sha256::Hash::hash(pin.as_bytes()).to_string();
+        let mut dbtx = self.db.begin_transaction().await;
+        dbtx.insert_entry(&PinCodeHashKey, &hash).await;
+        dbtx.commit_tx().await;
+        Ok(())
+    }
+
+    pub async fn verify_pin(&self, pin: String) -> bool {
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        if let Some(stored_hash) = dbtx.get_value(&PinCodeHashKey).await {
+            let input_hash = sha256::Hash::hash(pin.as_bytes()).to_string();
+            stored_hash == input_hash
+        } else {
+            false
+        }
+    }
+
+    pub async fn clear_pin_hash(&self) {
+        let mut dbtx = self.db.begin_transaction().await;
+        dbtx.remove_entry(&PinCodeHashKey).await;
+        dbtx.remove_entry(&RequirePinForSpendingKey).await;
+        dbtx.commit_tx().await;
+    }
+
+    pub async fn get_require_pin_for_spending(&self) -> bool {
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        dbtx.get_value(&RequirePinForSpendingKey).await.is_some()
+    }
+
+    pub async fn set_require_pin_for_spending(&self, require: bool) {
+        let mut dbtx = self.db.begin_transaction().await;
+        if require {
+            dbtx.insert_entry(&RequirePinForSpendingKey, &()).await;
+        } else {
+            dbtx.remove_entry(&RequirePinForSpendingKey).await;
+        }
         dbtx.commit_tx().await;
     }
 }

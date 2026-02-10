@@ -9,6 +9,7 @@ import 'package:ecashapp/providers/preferences_provider.dart';
 import 'package:ecashapp/success.dart';
 import 'package:ecashapp/toast.dart';
 import 'package:ecashapp/utils.dart';
+import 'package:ecashapp/utils/pin_guard.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -176,6 +177,9 @@ class _OnchainSendState extends State<OnchainSend> {
         _actualWithdrawalAmount == null) {
       return;
     }
+
+    final authorized = await checkSpendingPin(context);
+    if (!authorized) return;
 
     _quoteTimer?.cancel();
     setState(() => _withdrawing = true);

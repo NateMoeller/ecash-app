@@ -122,6 +122,8 @@ abstract class Multimint implements RustOpaqueInterface {
     required FederationId federationId,
   });
 
+  Future<void> clearPinHash();
+
   Future<bool> containsClient({required FederationId federationId});
 
   Future<List<(FederationSelector, bool)>> federations();
@@ -174,6 +176,10 @@ abstract class Multimint implements RustOpaqueInterface {
     required FederationId federationId,
     required int moduleId,
   });
+
+  Future<bool> getRequirePinForSpending();
+
+  Future<bool> hasPinCode();
 
   Future<bool> hasSeedPhraseAck();
 
@@ -269,12 +275,18 @@ abstract class Multimint implements RustOpaqueInterface {
 
   Future<void> setFiatCurrency({required FiatCurrency fiatCurrency});
 
+  Future<void> setPinHash({required String pin});
+
+  Future<void> setRequirePinForSpending({required bool require});
+
   Future<List<Transaction>> transactions({
     required FederationId federationId,
     BigInt? timestamp,
     Uint8List? operationId,
     required List<String> modules,
   });
+
+  Future<bool> verifyPin({required String pin});
 
   Future<List<Utxo>> walletSummary({
     String? invite,

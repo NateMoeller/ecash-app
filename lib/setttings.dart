@@ -5,6 +5,7 @@ import 'package:ecashapp/mnemonic.dart';
 import 'package:ecashapp/multimint.dart';
 import 'package:ecashapp/nwc.dart';
 import 'package:ecashapp/relays.dart';
+import 'package:ecashapp/screens/access_control.dart';
 import 'package:ecashapp/screens/display_settings.dart';
 import 'package:ecashapp/theme.dart';
 import 'package:flutter/material.dart';
@@ -137,6 +138,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 context,
                 MaterialPageRoute(
                   builder: (context) => const DisplaySettingsScreen(),
+                ),
+              );
+            },
+          ),
+          _SettingsOption(
+            icon: Icon(
+              Icons.lock,
+              color: Theme.of(context).colorScheme.primary,
+            ),
+            title: 'Access Control',
+            subtitle: 'Set up PIN code and spending protection',
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => const AccessControlScreen(),
                 ),
               );
             },

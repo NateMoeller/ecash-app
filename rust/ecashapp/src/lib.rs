@@ -1062,6 +1062,46 @@ pub async fn set_fiat_currency(fiat_currency: FiatCurrency) {
 }
 
 #[frb]
+pub async fn has_pin_code() -> bool {
+    let multimint = get_multimint();
+    multimint.has_pin_code().await
+}
+
+#[frb]
+pub async fn set_pin_code(pin: String) -> anyhow::Result<()> {
+    let multimint = get_multimint();
+    multimint.set_pin_hash(pin).await
+}
+
+#[frb]
+pub async fn verify_pin(pin: String) -> bool {
+    let multimint = get_multimint();
+    multimint.verify_pin(pin).await
+}
+
+#[frb]
+pub async fn clear_pin_code(pin: String) -> anyhow::Result<()> {
+    let multimint = get_multimint();
+    if !multimint.verify_pin(pin).await {
+        anyhow::bail!("Incorrect PIN");
+    }
+    multimint.clear_pin_hash().await;
+    Ok(())
+}
+
+#[frb]
+pub async fn get_require_pin_for_spending() -> bool {
+    let multimint = get_multimint();
+    multimint.get_require_pin_for_spending().await
+}
+
+#[frb]
+pub async fn set_require_pin_for_spending(require: bool) {
+    let multimint = get_multimint();
+    multimint.set_require_pin_for_spending(require).await;
+}
+
+#[frb]
 pub async fn get_all_btc_prices() -> Option<Vec<(FiatCurrency, u64)>> {
     let multimint = get_multimint();
     multimint.get_all_btc_prices().await

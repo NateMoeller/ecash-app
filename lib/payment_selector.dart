@@ -3,6 +3,7 @@ import 'package:ecashapp/multimint.dart';
 import 'package:ecashapp/scan.dart';
 import 'package:ecashapp/send.dart';
 import 'package:ecashapp/utils.dart';
+import 'package:ecashapp/utils/pin_guard.dart';
 import 'package:flutter/material.dart';
 
 class PaymentMethodSelector extends StatefulWidget {
@@ -120,6 +121,10 @@ class _PaymentMethodSelectorState extends State<PaymentMethodSelector> {
   void _onConfirmPressed() async {
     if (_selected == 'lnaddress') {
       try {
+        final authorized = await checkSpendingPin(context);
+        if (!authorized) return;
+        if (!mounted) return;
+
         final address = _lightningAddressController.text;
         final amount = BigInt.parse(_amountController.text) * BigInt.from(1000);
         AppLogger.instance.info('Lightning Address: $address, Amount: $amount');
