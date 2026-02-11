@@ -36,9 +36,10 @@ class _PinGatedAppState extends State<PinGatedApp> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.paused ||
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden) {
-      _backgroundedAt = DateTime.now();
+      _backgroundedAt ??= DateTime.now();
     } else if (state == AppLifecycleState.resumed) {
       _checkLockOnResume();
     }
