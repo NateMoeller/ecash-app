@@ -21,8 +21,12 @@
 - Update versions:
   - `pubspec.yaml`: `version: X.Y.Z`
   - `rust/ecashapp/Cargo.toml`: `version = "X.Y.Z"`
-  - `linux/appstream/org.fedimint.app.appdata.xml`: Add `<release version="X.Y.Z" date="YYYY-MM-DD" />` entry
+  - `just build-linux`
+  - `flutter analyze`
 - Commit: `git commit -am "chore: bump version to vX.Y.Z"`
+- Add appstream release entry:
+  - `linux/appstream/org.fedimint.app.appdata.xml`: Add `<release version="X.Y.Z" date="YYYY-MM-DD" />` entry
+  - Commit: `git commit -am "chore: add appstream release entry for vX.Y.Z"`
 - Push: `git push upstream releases/vX.Y.Z`
 - Tag: `git tag -a -s vX.Y.Z`
 - Push tag: `git push upstream vX.Y.Z`
@@ -31,9 +35,11 @@
 ## Post-Release
 
 - Add branch protection to `releases/vX.Y` (first release only)
+- PR the appstream release entry cherry-pick to `releases/vX.Y`
 - PR to bump master to next alpha:
   - `pubspec.yaml`: `version: X.(Y+1).0-alpha`
   - `rust/ecashapp/Cargo.toml`: `version = "X.(Y+1).0-alpha"`
+  - Include the appstream release entry cherry-pick
 
 ## Version Code Reference
 
