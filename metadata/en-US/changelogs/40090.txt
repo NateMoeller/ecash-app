@@ -1,3 +1,0 @@
-Initial F-Droid release of Ecash App v0.4.0.
-
-Features include Lightning, on-chain, and ecash payments, multi-federation support, Lightning Address, Nostr Wallet Connect, and federation discovery via Nostr.
