@@ -58,6 +58,11 @@
               if [ -d .git ]; then
                 ln -sf "$PWD/scripts/git-hooks/pre-commit.sh" .git/hooks/pre-commit
               fi
+              # Ensure flutter deps are resolved (needed for dart format in pre-commit hook)
+              if [ ! -f .dart_tool/package_config.json ]; then
+                echo "Running flutter pub get (first-time setup)..."
+                flutter pub get > /dev/null 2>&1
+              fi
 	    '';
           });
         };
