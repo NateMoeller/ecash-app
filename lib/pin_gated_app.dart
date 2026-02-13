@@ -30,18 +30,19 @@ class _PinGatedAppState extends State<PinGatedApp>
   @override
   void initState() {
     super.initState();
-    _state =
-        widget.pinRequired ? _LockState.locked : _LockState.unlocked;
+    _state = widget.pinRequired ? _LockState.locked : _LockState.unlocked;
     _controller = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 500),
     );
-    _fadeAnimation = Tween<double>(begin: 1.0, end: 0.0).animate(
-      CurvedAnimation(parent: _controller, curve: Curves.easeInCubic),
-    );
-    _scaleAnimation = Tween<double>(begin: 1.0, end: 1.05).animate(
-      CurvedAnimation(parent: _controller, curve: Curves.easeInCubic),
-    );
+    _fadeAnimation = Tween<double>(
+      begin: 1.0,
+      end: 0.0,
+    ).animate(CurvedAnimation(parent: _controller, curve: Curves.easeInCubic));
+    _scaleAnimation = Tween<double>(
+      begin: 1.0,
+      end: 1.05,
+    ).animate(CurvedAnimation(parent: _controller, curve: Curves.easeInCubic));
     _controller.addStatusListener((status) {
       if (status == AnimationStatus.completed) {
         setState(() => _state = _LockState.unlocked);
@@ -99,10 +100,7 @@ class _PinGatedAppState extends State<PinGatedApp>
                 ignoring: _state == _LockState.unlocking,
                 child: FadeTransition(
                   opacity: _fadeAnimation,
-                  child: ScaleTransition(
-                    scale: _scaleAnimation,
-                    child: child,
-                  ),
+                  child: ScaleTransition(scale: _scaleAnimation, child: child),
                 ),
               );
             },
