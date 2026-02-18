@@ -413,6 +413,23 @@ Future<FiatCurrency> getFiatCurrency() =>
 Future<void> setFiatCurrency({required FiatCurrency fiatCurrency}) =>
     RustLib.instance.api.crateSetFiatCurrency(fiatCurrency: fiatCurrency);
 
+Future<bool> hasPinCode() => RustLib.instance.api.crateHasPinCode();
+
+Future<void> setPinCode({required String pin}) =>
+    RustLib.instance.api.crateSetPinCode(pin: pin);
+
+Future<bool> verifyPin({required String pin}) =>
+    RustLib.instance.api.crateVerifyPin(pin: pin);
+
+Future<void> clearPinCode({required String pin}) =>
+    RustLib.instance.api.crateClearPinCode(pin: pin);
+
+Future<bool> getRequirePinForSpending() =>
+    RustLib.instance.api.crateGetRequirePinForSpending();
+
+Future<void> setRequirePinForSpending({required bool require}) =>
+    RustLib.instance.api.crateSetRequirePinForSpending(require: require);
+
 Future<List<(FiatCurrency, BigInt)>?> getAllBtcPrices() =>
     RustLib.instance.api.crateGetAllBtcPrices();
 

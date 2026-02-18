@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:ecashapp/app.dart';
 import 'package:ecashapp/lib.dart';
+import 'package:ecashapp/pin_gated_app.dart';
 import 'package:ecashapp/utils.dart';
 import 'package:flutter/material.dart';
 import 'create_wallet.dart';
@@ -34,9 +35,13 @@ class _SplashState extends State<Splash> {
         isDesktop: Platform.isLinux | Platform.isMacOS,
       );
       final initialFeds = await federations();
-      screen = MyApp(
-        initialFederations: initialFeds,
-        recoverFederationInviteCodes: false,
+      final pinRequired = await hasPinCode();
+      screen = PinGatedApp(
+        pinRequired: pinRequired,
+        child: MyApp(
+          initialFederations: initialFeds,
+          recoverFederationInviteCodes: false,
+        ),
       );
     } else {
       screen = CreateWallet(dir: widget.dir);

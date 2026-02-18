@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:ecashapp/app.dart';
 import 'package:ecashapp/lib.dart';
+import 'package:ecashapp/pin_gated_app.dart';
 import 'package:ecashapp/seed_input.dart';
 import 'package:ecashapp/utils.dart';
 import 'package:flutter/material.dart';
@@ -45,9 +46,12 @@ class _CreateWalletState extends State<CreateWallet> {
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(
             builder:
-                (_) => MyApp(
-                  initialFederations: [],
-                  recoverFederationInviteCodes: false,
+                (_) => PinGatedApp(
+                  pinRequired: false,
+                  child: MyApp(
+                    initialFederations: [],
+                    recoverFederationInviteCodes: false,
+                  ),
                 ),
           ),
         );
@@ -69,9 +73,12 @@ class _CreateWalletState extends State<CreateWallet> {
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(
             builder:
-                (_) => MyApp(
-                  initialFederations: [],
-                  recoverFederationInviteCodes: true,
+                (_) => PinGatedApp(
+                  pinRequired: false,
+                  child: MyApp(
+                    initialFederations: [],
+                    recoverFederationInviteCodes: true,
+                  ),
                 ),
           ),
         );

@@ -9,6 +9,7 @@ import 'package:ecashapp/lib.dart';
 import 'package:ecashapp/multimint.dart';
 import 'package:ecashapp/toast.dart';
 import 'package:ecashapp/utils.dart';
+import 'package:ecashapp/utils/pin_guard.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -47,6 +48,11 @@ class _EcashSendState extends State<EcashSend> {
 
   Future<void> _loadEcash() async {
     try {
+      final authorized = await checkSpendingPin(context);
+      if (!authorized) {
+        if (mounted) Navigator.of(context).pop();
+        return;
+      }
       final ecash = await sendEcash(
         federationId: widget.fed.federationId,
         amountMsats: widget.amountMsats,

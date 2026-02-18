@@ -1,5 +1,6 @@
 use std::time::SystemTime;
 
+use bitcoin::hashes::sha256;
 use fedimint_core::{
     config::{ClientConfig, FederationId},
     encoding::{Decodable, Encodable},
@@ -45,6 +46,8 @@ pub(crate) enum DbKeyPrefix {
     Contact = 0x0D,
     ContactSyncConfig = 0x10,
     SchemaVersion = 0x11,
+    PinCodeHash = 0x12,
+    RequirePinForSpending = 0x13,
 }
 
 #[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -333,4 +336,22 @@ impl_db_record!(
     key = SchemaVersionKey,
     value = u64,
     db_prefix = DbKeyPrefix::SchemaVersion,
+);
+
+#[derive(Debug, Encodable, Decodable)]
+pub(crate) struct PinCodeHashKey;
+
+impl_db_record!(
+    key = PinCodeHashKey,
+    value = sha256::Hash,
+    db_prefix = DbKeyPrefix::PinCodeHash,
+);
+
+#[derive(Debug, Encodable, Decodable)]
+pub(crate) struct RequirePinForSpendingKey;
+
+impl_db_record!(
+    key = RequirePinForSpendingKey,
+    value = (),
+    db_prefix = DbKeyPrefix::RequirePinForSpending,
 );

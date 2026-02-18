@@ -5,6 +5,7 @@ import 'package:ecashapp/multimint.dart';
 import 'package:ecashapp/providers/preferences_provider.dart';
 import 'package:ecashapp/send.dart';
 import 'package:ecashapp/utils.dart';
+import 'package:ecashapp/utils/pin_guard.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -93,7 +94,10 @@ class PaymentPreviewWidget extends StatelessWidget {
                 borderRadius: BorderRadius.circular(16),
               ),
             ),
-            onPressed: () {
+            onPressed: () async {
+              final authorized = await checkSpendingPin(context);
+              if (!authorized) return;
+              if (!context.mounted) return;
               Navigator.push(
                 context,
                 MaterialPageRoute(
