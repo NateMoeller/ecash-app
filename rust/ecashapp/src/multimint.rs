@@ -3343,10 +3343,8 @@ impl Multimint {
             .clone();
 
         let mint = client.get_first_module::<MintClientModule>()?;
-        let mut dbtx = client.db().begin_transaction_nc().await;
-        let tiered_notes = mint
-            .get_note_counts_by_denomination(&mut dbtx.to_ref_with_prefix_module_id(1).0)
-            .await;
+        let mut dbtx = mint.client_ctx.module_db().begin_transaction_nc().await;
+        let tiered_notes = mint.get_note_counts_by_denomination(&mut dbtx).await;
         let notes = tiered_notes
             .iter()
             .map(|(amount, count)| (amount.msats, count))
@@ -3869,7 +3867,7 @@ impl Multimint {
         if pin.len() < 4 || pin.len() > 6 || !pin.chars().all(|c| c.is_ascii_digit()) {
             bail!("PIN must be 4-6 digits");
         }
-        let hash = sha256::Hash::hash(pin.as_bytes()).to_string();
+        let hash = sha256::Hash::hash(pin.as_bytes());
         let mut dbtx = self.db.begin_transaction().await;
         dbtx.insert_entry(&PinCodeHashKey, &hash).await;
         dbtx.commit_tx().await;
@@ -3879,7 +3877,7 @@ impl Multimint {
     pub async fn verify_pin(&self, pin: String) -> bool {
         let mut dbtx = self.db.begin_transaction_nc().await;
         if let Some(stored_hash) = dbtx.get_value(&PinCodeHashKey).await {
-            let input_hash = sha256::Hash::hash(pin.as_bytes()).to_string();
+            let input_hash = sha256::Hash::hash(pin.as_bytes());
             stored_hash == input_hash
         } else {
             false

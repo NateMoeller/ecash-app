@@ -1,5 +1,6 @@
 use std::time::SystemTime;
 
+use bitcoin::hashes::sha256;
 use fedimint_core::{
     config::{ClientConfig, FederationId},
     encoding::{Decodable, Encodable},
@@ -342,7 +343,7 @@ pub(crate) struct PinCodeHashKey;
 
 impl_db_record!(
     key = PinCodeHashKey,
-    value = String,
+    value = sha256::Hash,
     db_prefix = DbKeyPrefix::PinCodeHash,
 );
 
