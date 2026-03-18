@@ -1235,5 +1235,14 @@
   "@openSettings": {},
 
   "scanQrCodeTooltip": "Scan QR code",
-  "@scanQrCodeTooltip": {}
+  "@scanQrCodeTooltip": {},
+
+  "viewAllTransactions": "View all",
+  "@viewAllTransactions": {},
+
+  "recentActivity": "Recent Activity",
+  "@recentActivity": {},
+
+  "noRecentTransactions": "No recent transactions",
+  "@noRecentTransactions": {}
 }
