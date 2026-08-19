@@ -14,6 +14,15 @@ import 'package:ecashapp/utils/pin_guard.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+/// Whether this platform can actually answer wallet-connect requests.
+///
+/// NWC needs a listener that outlives the screen that created it: Android runs
+/// one in a foreground service, Linux/macOS in a Rust task that lives as long as
+/// the app. iOS has neither — it suspends the process seconds after
+/// backgrounding and has no foreground-service equivalent — so a pairing created
+/// there would hand out remote spending authority that never answers.
+bool get nwcSupported => !Platform.isIOS;
+
 // TaskHandler for foreground service - calls Rust NWC listener directly
 // The TaskHandler cannot have any log statements using `AppLogger`, it will crash
 // the foreground task.
@@ -112,6 +121,11 @@ class _NostrWalletConnectState extends State<NostrWalletConnect> {
   }
 
   Future<void> _startForegroundService(FederationSelector federation) async {
+    // Guarded here as well as at the settings entry point. The state set at the
+    // end of this method claims a listener is running; on a platform where none
+    // can start, that is a lie about who is able to spend from this wallet.
+    if (!nwcSupported) return;
+
     if (Platform.isAndroid) {
       AppLogger.instance.info(
         '[NWC] Starting foreground service for ${federation.federationName}',

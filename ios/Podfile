@@ -45,14 +45,14 @@ post_install do |installer|
       # defaults to 0 (see its PermissionHandlerEnums.h). Undefined means the
       # strategy is stubbed out and returns PermissionStatusDenied without ever
       # prompting — Permission.camera.request() fails silently. Enable exactly
-      # the permissions the app asks for: camera (lib/scan.dart) and
-      # notifications (lib/nwc.dart). Location goes through geolocator, which
-      # does not use these macros.
+      # the permissions the app asks for, which on iOS is only camera
+      # (lib/scan.dart). Notifications are requested solely by lib/nwc.dart, and
+      # NWC is not offered on iOS. Location goes through geolocator, which does
+      # not use these macros.
       defs = config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] || ['$(inherited)']
       defs = [defs] unless defs.is_a?(Array)
       config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] = defs + [
         'PERMISSION_CAMERA=1',
-        'PERMISSION_NOTIFICATIONS=1',
       ]
     end
   end

@@ -33,8 +33,9 @@ void main() async {
   WidgetsBinding.instance.platformDispatcher.onError =
       (error, stack) => _isTileCancellation(error);
 
-  // Initialize foreground task (Android/iOS only)
-  if (Platform.isAndroid || Platform.isIOS) {
+  // Android only: NWC is the sole user of the foreground task plugin, and it is
+  // not offered on iOS because nothing there can keep the listener alive.
+  if (Platform.isAndroid) {
     FlutterForegroundTask.initCommunicationPort();
   }
 
