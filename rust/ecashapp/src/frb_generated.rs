@@ -16746,7 +16746,7 @@ impl SseDecode for crate::multimint::LNAddressStatus {
     }
 }
 
-impl SseDecode for crate::LnurlWithdrawParams {
+impl SseDecode for crate::lnurl_client::LnurlWithdrawParams {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         let mut var_callback = <String>::sse_decode(deserializer);
@@ -16754,7 +16754,7 @@ impl SseDecode for crate::LnurlWithdrawParams {
         let mut var_minWithdrawableMsats = <u64>::sse_decode(deserializer);
         let mut var_maxWithdrawableMsats = <u64>::sse_decode(deserializer);
         let mut var_defaultDescription = <String>::sse_decode(deserializer);
-        return crate::LnurlWithdrawParams {
+        return crate::lnurl_client::LnurlWithdrawParams {
             callback: var_callback,
             k1: var_k1,
             min_withdrawable_msats: var_minWithdrawableMsats,
@@ -19792,7 +19792,7 @@ impl flutter_rust_bridge::IntoIntoDart<crate::multimint::LNAddressStatus>
     }
 }
 // Codec=Dco (DartCObject based), see doc to use other codecs
-impl flutter_rust_bridge::IntoDart for crate::LnurlWithdrawParams {
+impl flutter_rust_bridge::IntoDart for crate::lnurl_client::LnurlWithdrawParams {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
             self.callback.into_into_dart().into_dart(),
@@ -19804,9 +19804,14 @@ impl flutter_rust_bridge::IntoDart for crate::LnurlWithdrawParams {
         .into_dart()
     }
 }
-impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::LnurlWithdrawParams {}
-impl flutter_rust_bridge::IntoIntoDart<crate::LnurlWithdrawParams> for crate::LnurlWithdrawParams {
-    fn into_into_dart(self) -> crate::LnurlWithdrawParams {
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::lnurl_client::LnurlWithdrawParams
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::lnurl_client::LnurlWithdrawParams>
+    for crate::lnurl_client::LnurlWithdrawParams
+{
+    fn into_into_dart(self) -> crate::lnurl_client::LnurlWithdrawParams {
         self
     }
 }
@@ -21762,7 +21767,7 @@ impl SseEncode for crate::multimint::LNAddressStatus {
     }
 }
 
-impl SseEncode for crate::LnurlWithdrawParams {
+impl SseEncode for crate::lnurl_client::LnurlWithdrawParams {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         <String>::sse_encode(self.callback, serializer);

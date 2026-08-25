@@ -13,6 +13,7 @@ import 'frb_generated.dart';
 import 'frb_generated.io.dart'
     if (dart.library.js_interop) 'frb_generated.web.dart';
 import 'lib.dart';
+import 'lnurl_client.dart';
 import 'multimint.dart';
 import 'nostr.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';

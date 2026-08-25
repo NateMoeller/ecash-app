@@ -3,6 +3,7 @@ import 'package:ecashapp/db.dart';
 import 'package:ecashapp/ecash_send.dart';
 import 'package:ecashapp/extensions/build_context_l10n.dart';
 import 'package:ecashapp/lib.dart';
+import 'package:ecashapp/lnurl_client.dart';
 import 'package:ecashapp/multimint.dart';
 import 'package:ecashapp/lnurl_withdraw.dart';
 import 'package:ecashapp/onchain_send.dart';

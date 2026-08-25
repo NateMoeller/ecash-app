@@ -7,6 +7,7 @@ mod db;
 mod event_bus;
 mod fountain;
 mod frb_generated;
+mod lnurl_client;
 mod multimint;
 mod net;
 mod nostr;
@@ -25,6 +26,7 @@ use fedimint_core::config::ClientConfig;
 use app_error::{EcashAppError, EcashAppResult};
 use flutter_rust_bridge::frb;
 use futures_util::StreamExt;
+use lnurl_client::LnurlWithdrawParams;
 use multimint::{
     EcashSendFees, FederationMeta, FederationSelector, GuardianAuditSummary,
     GuardianBackupStatistics, GuardianMetaState, GuardianStatusSummary, LightningSendOutcome,
@@ -301,11 +303,8 @@ pub async fn max_lightning_send(
     let gateway = SafeUrl::parse(&gateway)?;
     let multimint = get_multimint();
 
-    let (async_client, pay_response) = lnurl_pay_response(&lnaddress_or_lnurl).await?;
-    let probe = async_client
-        .get_invoice(&pay_response, pay_response.min_sendable, None, None)
-        .await?;
-    let probe = Bolt11Invoice::from_str(probe.invoice())?;
+    let pay_params = lnurl_client::fetch_pay_params(&lnaddress_or_lnurl).await?;
+    let probe = lnurl_client::fetch_invoice(&pay_params, pay_params.min_sendable).await?;
 
     let loopback = multimint
         .probe_invoice_is_loopback(federation_id, &gateway, is_lnv2, &probe)
@@ -314,26 +313,7 @@ pub async fn max_lightning_send(
     let max = multimint
         .max_lightning_send(federation_id, gateway, is_lnv2, loopback)
         .await?;
-    Ok(max.min(pay_response.max_sendable))
-}
-
-/// Resolves a Lightning Address or raw LNURL to its LNURL-pay parameters,
-/// together with the client that fetched them so an invoice can be requested on
-/// the same connection.
-async fn lnurl_pay_response(
-    lnurl_or_address: &str,
-) -> anyhow::Result<(lnurl::AsyncClient, lnurl::pay::PayResponse)> {
-    let lnurl = match lnurl::lightning_address::LightningAddress::from_str(lnurl_or_address) {
-        Ok(lightning_address) => lightning_address.lnurl(),
-        _ => lnurl::lnurl::LnUrl::from_str(lnurl_or_address)?,
-    };
-
-    let async_client = lnurl::AsyncClient::from_client(crate::net::http_client());
-    let response = async_client.make_request(&lnurl.url).await?;
-    match response {
-        lnurl::LnUrlResponse::LnUrlPayResponse(pay_response) => Ok((async_client, pay_response)),
-        other => bail!("Unexpected response from lnurl: {other:?}"),
-    }
+    Ok(max.min(pay_params.max_sendable))
 }
 
 #[frb]
@@ -387,155 +367,30 @@ pub async fn compute_receive_amount_with_fees(
         .await
 }
 
-/// LUD-06 requires the wallet to check that the invoice an LNURL-pay server
-/// hands back actually matches what was asked for. `lnurl-rs` validates the
-/// *requested* amount against the server's `min/maxSendable` and then returns
-/// the server's invoice verbatim, so nothing downstream catches a server that
-/// answers a 10 sat request with a 10,000 sat invoice: the fedimint modules
-/// fund a contract for the invoice's amount, while the fee quote the user
-/// approved was computed on the requested amount.
-///
-/// `expected_network` is `None` when the federation's network is unknown, in
-/// which case the network check is skipped — the amount check is not optional.
-fn verify_lnurl_invoice(
-    bolt11: &Bolt11Invoice,
-    requested_msats: u64,
-    expected_network: Option<bitcoin::Network>,
-) -> Result<(), EcashAppError> {
-    match bolt11.amount_milli_satoshis() {
-        Some(invoice_msats) if invoice_msats == requested_msats => {}
-        Some(invoice_msats) => {
-            return Err(EcashAppError::LnurlAmountMismatch {
-                requested_msats,
-                invoice_msats,
-            })
-        }
-        // An amountless invoice would let the gateway settle for any value it
-        // likes, so it is never acceptable as an answer to an amount request.
-        None => {
-            return Err(EcashAppError::InvalidInvoice(
-                "LNURL server returned an invoice with no amount".to_string(),
-            ))
-        }
-    }
-
-    if let Some(expected) = expected_network {
-        let invoice_network = bolt11.network();
-        if invoice_network != expected {
-            return Err(EcashAppError::InvalidInvoice(format!(
-                "LNURL server returned a {invoice_network} invoice, but this federation is on {expected}"
-            )));
-        }
-    }
-
-    Ok(())
-}
-
 #[frb]
 pub async fn get_invoice_from_lnaddress_or_lnurl(
     federation_id: &FederationId,
     amount_msats: u64,
     lnaddress_or_lnurl: String,
 ) -> Result<String, EcashAppError> {
-    // A malformed input (neither a valid lightning address nor LNURL) is a
-    // distinct, user-actionable error. Everything past this point is a
-    // reachability/protocol failure, which we keep generic so the UI can fall
-    // back to its "could not reach" message.
-    let lnurl = match lnurl::lightning_address::LightningAddress::from_str(&lnaddress_or_lnurl) {
-        Ok(lightning_address) => lightning_address.lnurl(),
-        _ => lnurl::lnurl::LnUrl::from_str(&lnaddress_or_lnurl)
-            .map_err(|e| EcashAppError::InvalidLightningAddress(e.to_string()))?,
-    };
+    let pay_params = lnurl_client::fetch_pay_params(&lnaddress_or_lnurl).await?;
+    let bolt11 = lnurl_client::fetch_invoice(&pay_params, amount_msats).await?;
 
-    let async_client = lnurl::AsyncClient::from_client(crate::net::http_client());
-    let response = async_client
-        .make_request(&lnurl.url)
-        .await
-        .map_err(|e| EcashAppError::other(format!("LNURL request failed: {e}")))?;
-    match response {
-        lnurl::LnUrlResponse::LnUrlPayResponse(response) => {
-            let invoice = async_client
-                .get_invoice(&response, amount_msats, None, None)
-                .await
-                .map_err(|e| EcashAppError::other(format!("LNURL invoice fetch failed: {e}")))?;
-
-            let bolt11 = Bolt11Invoice::from_str(invoice.invoice())
-                .map_err(|e| EcashAppError::InvalidInvoice(e.to_string()))?;
-            let multimint = get_multimint();
-            verify_lnurl_invoice(
-                &bolt11,
-                amount_msats,
-                multimint.federation_network(federation_id).await,
-            )?;
-            Ok(bolt11.to_string())
-        }
-        other => Err(EcashAppError::other(format!(
-            "Unexpected response from lnurl: {other:?}"
-        ))),
-    }
+    let multimint = get_multimint();
+    lnurl_client::verify_invoice(
+        &bolt11,
+        amount_msats,
+        multimint.federation_network(federation_id).await,
+    )?;
+    Ok(bolt11.to_string())
 }
 
-/// Parameters returned by a LNURLw (LNURL Withdraw) endpoint.
-/// Shown to the user before they confirm a Boltcard withdraw.
-#[derive(Debug)]
-#[frb]
-pub struct LnurlWithdrawParams {
-    pub callback: String,
-    pub k1: String,
-    pub min_withdrawable_msats: u64,
-    pub max_withdrawable_msats: u64,
-    pub default_description: String,
-}
-
-/// Fetch withdraw parameters from a LNURLw HTTPS endpoint (LUD-03 / LUD-17).
-/// Pure read — no side effects. Call this first so the UI can show the
-/// withdraw details and get user confirmation before any money moves.
+/// Fetch withdraw parameters from a LNURLw endpoint — see
+/// [`lnurl_client::fetch_withdraw_params`]. Pure read, no side effects: call it
+/// first so the UI can confirm the withdraw with the user before money moves.
 #[frb]
 pub async fn fetch_lnurl_withdraw(url: String) -> anyhow::Result<LnurlWithdrawParams> {
-    let resp: serde_json::Value = crate::net::http_client()
-        .get(&url)
-        .send()
-        .await?
-        .json()
-        .await?;
-    parse_lnurl_withdraw_response(resp)
-}
-
-fn parse_lnurl_withdraw_response(resp: serde_json::Value) -> anyhow::Result<LnurlWithdrawParams> {
-    // LUD-03: the server may return an error before we even get to the withdraw params.
-    if resp.get("status").and_then(|s| s.as_str()) == Some("ERROR") {
-        let reason = resp
-            .get("reason")
-            .and_then(|r| r.as_str())
-            .unwrap_or("unknown error");
-        bail!("LNURLw service error: {reason}");
-    }
-
-    let tag = resp.get("tag").and_then(|t| t.as_str()).unwrap_or("");
-    if tag != "withdrawRequest" {
-        bail!("Expected LNURLw withdraw response (tag=withdrawRequest), got: {tag:?}");
-    }
-
-    Ok(LnurlWithdrawParams {
-        callback: resp["callback"]
-            .as_str()
-            .ok_or_else(|| anyhow!("LNURLw response missing callback"))?
-            .to_string(),
-        k1: resp["k1"]
-            .as_str()
-            .ok_or_else(|| anyhow!("LNURLw response missing k1"))?
-            .to_string(),
-        min_withdrawable_msats: resp["minWithdrawable"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("LNURLw response missing minWithdrawable"))?,
-        max_withdrawable_msats: resp["maxWithdrawable"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("LNURLw response missing maxWithdrawable"))?,
-        default_description: resp["defaultDescription"]
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
-    })
+    lnurl_client::fetch_withdraw_params(&url).await
 }
 
 /// Create a Lightning invoice, send it to the LNURLw callback URL, and return
@@ -570,29 +425,9 @@ pub async fn execute_lnurl_withdraw(
         .await?;
 
     // Hand the invoice to the Boltcard/LNURLw service via the callback URL.
-    let callback_url = build_lnurlw_callback_url(&callback, &k1, &invoice.to_string());
-    let resp: serde_json::Value = crate::net::http_client()
-        .get(&callback_url)
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    if resp.get("status").and_then(|s| s.as_str()) == Some("ERROR") {
-        let reason = resp
-            .get("reason")
-            .and_then(|r| r.as_str())
-            .unwrap_or("unknown error");
-        bail!("LNURLw service rejected the request: {reason}");
-    }
+    lnurl_client::submit_withdraw_invoice(&callback, &k1, &invoice.to_string()).await?;
 
     Ok(op_id)
-}
-
-/// LUD-03: append k1 and pr to the callback URL, respecting existing query params.
-fn build_lnurlw_callback_url(callback: &str, k1: &str, invoice: &str) -> String {
-    let separator = if callback.contains('?') { '&' } else { '?' };
-    format!("{}{}k1={}&pr={}", callback, separator, k1, invoice)
 }
 
 #[frb]
@@ -1062,15 +897,12 @@ impl parse::ParseContext for MultimintParseContext {
         &self,
         lnurl_or_address: &str,
     ) -> anyhow::Result<bitcoin::Network> {
-        let (async_client, pay_response) = lnurl_pay_response(lnurl_or_address).await?;
+        let pay_params = lnurl_client::fetch_pay_params(lnurl_or_address).await?;
 
         // The smallest invoice the server will mint for us. Most LNURL-pay
         // servers reject anything below `minSendable`, so probing at 1 msat
         // (or any fixed constant) is unreliable.
-        let invoice = async_client
-            .get_invoice(&pay_response, pay_response.min_sendable, None, None)
-            .await?;
-        let bolt11 = Bolt11Invoice::from_str(invoice.invoice())?;
+        let bolt11 = lnurl_client::fetch_invoice(&pay_params, pay_params.min_sendable).await?;
         Ok(bolt11.network())
     }
 
@@ -1750,190 +1582,4 @@ pub async fn paginate_search_contacts(
     nostr
         .paginate_search_contacts(&query, cursor, limit as usize)
         .await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    // --- parse_lnurl_withdraw_response ---
-
-    #[test]
-    fn test_parse_valid_withdraw_response() {
-        let resp = json!({
-            "tag": "withdrawRequest",
-            "callback": "https://example.com/withdraw",
-            "k1": "abc123",
-            "minWithdrawable": 1000,
-            "maxWithdrawable": 100000,
-            "defaultDescription": "Test withdraw"
-        });
-        let params = parse_lnurl_withdraw_response(resp).unwrap();
-        assert_eq!(params.callback, "https://example.com/withdraw");
-        assert_eq!(params.k1, "abc123");
-        assert_eq!(params.min_withdrawable_msats, 1000);
-        assert_eq!(params.max_withdrawable_msats, 100000);
-        assert_eq!(params.default_description, "Test withdraw");
-    }
-
-    #[test]
-    fn test_parse_withdraw_response_missing_description_defaults_empty() {
-        let resp = json!({
-            "tag": "withdrawRequest",
-            "callback": "https://example.com/withdraw",
-            "k1": "abc123",
-            "minWithdrawable": 1000,
-            "maxWithdrawable": 100000
-        });
-        let params = parse_lnurl_withdraw_response(resp).unwrap();
-        assert_eq!(params.default_description, "");
-    }
-
-    #[test]
-    fn test_parse_withdraw_response_server_error() {
-        let resp = json!({
-            "status": "ERROR",
-            "reason": "card not found"
-        });
-        let err = parse_lnurl_withdraw_response(resp).unwrap_err();
-        assert!(err.to_string().contains("card not found"));
-    }
-
-    #[test]
-    fn test_parse_withdraw_response_wrong_tag() {
-        let resp = json!({
-            "tag": "payRequest",
-            "callback": "https://example.com/pay",
-            "k1": "abc123",
-            "minWithdrawable": 1000,
-            "maxWithdrawable": 100000
-        });
-        let err = parse_lnurl_withdraw_response(resp).unwrap_err();
-        assert!(err.to_string().contains("withdrawRequest"));
-    }
-
-    #[test]
-    fn test_parse_withdraw_response_missing_callback() {
-        let resp = json!({
-            "tag": "withdrawRequest",
-            "k1": "abc123",
-            "minWithdrawable": 1000,
-            "maxWithdrawable": 100000
-        });
-        let err = parse_lnurl_withdraw_response(resp).unwrap_err();
-        assert!(err.to_string().contains("missing callback"));
-    }
-
-    // --- build_lnurlw_callback_url ---
-
-    #[test]
-    fn test_callback_url_no_existing_params() {
-        let url =
-            build_lnurlw_callback_url("https://example.com/withdraw", "mykey", "lnbc1invoice");
-        assert_eq!(url, "https://example.com/withdraw?k1=mykey&pr=lnbc1invoice");
-    }
-
-    #[test]
-    fn test_callback_url_with_existing_params() {
-        let url = build_lnurlw_callback_url(
-            "https://example.com/withdraw?foo=bar",
-            "mykey",
-            "lnbc1invoice",
-        );
-        assert_eq!(
-            url,
-            "https://example.com/withdraw?foo=bar&k1=mykey&pr=lnbc1invoice"
-        );
-    }
-
-    // --- verify_lnurl_invoice ---
-
-    fn signed_invoice(
-        amount_msats: Option<u64>,
-        currency: lightning_invoice::Currency,
-    ) -> Bolt11Invoice {
-        use bitcoin::hashes::{sha256, Hash as _};
-        use bitcoin::secp256k1::{Secp256k1, SecretKey};
-        use lightning_invoice::{InvoiceBuilder, PaymentSecret};
-
-        let secret_key = SecretKey::from_slice(&[0x11; 32]).expect("valid key");
-        let builder = InvoiceBuilder::new(currency)
-            .description("lnurl test".to_string())
-            .payment_hash(sha256::Hash::hash(b"lnurl test payment hash"))
-            .payment_secret(PaymentSecret([42u8; 32]))
-            .current_timestamp()
-            .min_final_cltv_expiry_delta(144);
-        let builder = match amount_msats {
-            Some(msats) => builder.amount_milli_satoshis(msats),
-            None => builder,
-        };
-        builder
-            .build_signed(|hash| Secp256k1::new().sign_ecdsa_recoverable(hash, &secret_key))
-            .expect("invoice builds")
-    }
-
-    #[test]
-    fn test_verify_lnurl_invoice_accepts_exact_amount() {
-        let invoice = signed_invoice(Some(10_000), lightning_invoice::Currency::Bitcoin);
-        assert!(
-            verify_lnurl_invoice(&invoice, 10_000, Some(bitcoin::Network::Bitcoin)).is_ok(),
-            "an invoice matching the request should be accepted"
-        );
-    }
-
-    /// The H1 scenario: request 10 sats, server answers with an invoice for
-    /// 1000x that amount.
-    #[test]
-    fn test_verify_lnurl_invoice_rejects_overcharge() {
-        let invoice = signed_invoice(Some(10_000_000), lightning_invoice::Currency::Bitcoin);
-        let err = verify_lnurl_invoice(&invoice, 10_000, None).unwrap_err();
-        assert_eq!(
-            err,
-            EcashAppError::LnurlAmountMismatch {
-                requested_msats: 10_000,
-                invoice_msats: 10_000_000,
-            }
-        );
-    }
-
-    #[test]
-    fn test_verify_lnurl_invoice_rejects_undercharge() {
-        let invoice = signed_invoice(Some(1_000), lightning_invoice::Currency::Bitcoin);
-        let err = verify_lnurl_invoice(&invoice, 10_000, None).unwrap_err();
-        assert_eq!(
-            err,
-            EcashAppError::LnurlAmountMismatch {
-                requested_msats: 10_000,
-                invoice_msats: 1_000,
-            }
-        );
-    }
-
-    #[test]
-    fn test_verify_lnurl_invoice_rejects_amountless() {
-        let invoice = signed_invoice(None, lightning_invoice::Currency::Bitcoin);
-        let err = verify_lnurl_invoice(&invoice, 10_000, None).unwrap_err();
-        assert!(
-            matches!(err, EcashAppError::InvalidInvoice(msg) if msg.contains("no amount")),
-            "an amountless invoice lets the gateway settle for any value"
-        );
-    }
-
-    #[test]
-    fn test_verify_lnurl_invoice_rejects_network_mismatch() {
-        let invoice = signed_invoice(Some(10_000), lightning_invoice::Currency::Bitcoin);
-        let err =
-            verify_lnurl_invoice(&invoice, 10_000, Some(bitcoin::Network::Signet)).unwrap_err();
-        assert!(matches!(err, EcashAppError::InvalidInvoice(_)));
-    }
-
-    #[test]
-    fn test_verify_lnurl_invoice_skips_network_check_when_unknown() {
-        let invoice = signed_invoice(Some(10_000), lightning_invoice::Currency::Bitcoin);
-        assert!(
-            verify_lnurl_invoice(&invoice, 10_000, None).is_ok(),
-            "an unknown federation network must not block a correct invoice"
-        );
-    }
 }

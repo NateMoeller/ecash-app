@@ -14,6 +14,7 @@ import 'event_bus.dart';
 import 'fountain.dart';
 import 'frb_generated.dart';
 import 'lib.dart';
+import 'lnurl_client.dart';
 import 'multimint.dart';
 import 'nostr.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated_web.dart';
