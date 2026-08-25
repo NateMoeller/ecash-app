@@ -4,10 +4,13 @@ import 'package:ecashapp/utils.dart';
 
 /// Reassembly state for the legacy base64 QR-loop transfer format.
 ///
-/// Nothing in this app produces these frames — the only writers are other
-/// wallets, or someone holding a hostile code up to the camera — so every
-/// header field here is untrusted input. Lives apart from the scanner widget so
-/// the bounds and index rules can be tested without a camera.
+/// Data frames are produced by this app's own "Legacy" ecash-send mode
+/// (`dataToFrames` in qr_export.dart), so app-to-app transfers land here.
+/// Fountain frames are decode-only: nothing here writes them, and the only
+/// sources are other wallets or someone holding a hostile code up to the
+/// camera. Either way every header field is untrusted input — a sender is just
+/// whatever the camera saw. Lives apart from the scanner widget so the bounds
+/// and index rules can be tested without a camera.
 
 class FountainFramePending {
   final String idBase64; // used for dedupe
@@ -26,6 +29,40 @@ class FountainFrame {
   final Uint8List data;
 
   FountainFrame(this.version, this.indexes, this.data);
+}
+
+/// One data frame off the wire: a 5-byte header, then the chunk.
+///
+/// Extracted from the scanner so that `scan.dart` and its tests parse frames
+/// through the same code — a second copy of these offsets could drift from the
+/// encoder without anything failing.
+class QrDataFrame {
+  /// Nonce, totalFrames (uint16 BE), frameIndex (uint16 BE).
+  static const int headerLength = 5;
+
+  final int nonce;
+  final int totalFrames;
+  final int frameIndex;
+  final Uint8List data;
+
+  QrDataFrame({
+    required this.nonce,
+    required this.totalFrames,
+    required this.frameIndex,
+    required this.data,
+  });
+
+  /// Returns null when there are not enough bytes for a full header, which is
+  /// a truncated or non-data frame rather than something to reassemble.
+  static QrDataFrame? parse(Uint8List bytes) {
+    if (bytes.length < headerLength) return null;
+    return QrDataFrame(
+      nonce: bytes[0],
+      totalFrames: (bytes[1] << 8) + bytes[2],
+      frameIndex: (bytes[3] << 8) + bytes[4],
+      data: Uint8List.fromList(bytes.sublist(headerLength)),
+    );
+  }
 }
 
 class QrLoopSession {

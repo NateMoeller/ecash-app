@@ -1,9 +1,19 @@
 import 'dart:convert';
-import 'dart:math';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 
-const int MAX_NONCE = 256;
+/// Byte 0 of every data frame, identifying the transfer to the scanner.
+///
+/// Fixed for the life of a payload. The scanner reads a change of nonce as a
+/// new transfer and, while frames are still arriving, refuses to hand over
+/// (see the takeover guard in `_handleQrLoopChunk`) — so renumbering between
+/// repeats would get every later frame dropped rather than giving a missed one
+/// a second chance. The animation replays these same frames instead.
+///
+/// 100 is not available here: `_ScanState.FOUNTAIN_V1_CONST` claims that value
+/// as a format marker, and the scanner dispatches on this byte before it knows
+/// which kind of frame it is holding.
+const int _frameNonce = 0;
 
 List<Uint8List> cutAndPad(Uint8List data, int size) {
   final numChunks = (data.length / size).ceil();
@@ -47,13 +57,7 @@ Uint8List wrapData(Uint8List data) {
   return Uint8List.fromList([...lengthBuffer, ...hash, ...data]);
 }
 
-List<String> makeLoop(
-  Uint8List wrappedData,
-  int dataSize,
-  int index,
-  double Function() random,
-) {
-  final nonce = index % MAX_NONCE;
+List<String> makeLoop(Uint8List wrappedData, int dataSize) {
   final dataChunks = cutAndPad(wrappedData, dataSize);
   final result = <String>[];
 
@@ -61,7 +65,7 @@ List<String> makeLoop(
     result.add(
       makeDataFrame(
         data: dataChunks[i],
-        nonce: nonce,
+        nonce: _frameNonce,
         totalFrames: dataChunks.length,
         frameIndex: i,
       ),
@@ -71,26 +75,11 @@ List<String> makeLoop(
   return result;
 }
 
-List<String> dataToFrames(
-  dynamic dataOrStr, {
-  int dataSize = 100,
-  int loops = 1,
-}) {
-  int seed = 1;
-  double random() {
-    final x = sin(seed++) * 10000;
-    return x - x.floorToDouble();
-  }
-
+List<String> dataToFrames(dynamic dataOrStr, {int dataSize = 100}) {
   final data =
       (dataOrStr is String) ? utf8.encode(dataOrStr) : dataOrStr as Uint8List;
   final wrappedData = wrapData(Uint8List.fromList(data));
-
-  List<String> r = [];
-  for (int i = 0; i < loops; i++) {
-    r.addAll(makeLoop(wrappedData, dataSize, i, random));
-  }
-  return r;
+  return makeLoop(wrappedData, dataSize);
 }
 
 // --- Helper methods ---

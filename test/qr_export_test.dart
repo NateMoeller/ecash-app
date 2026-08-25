@@ -8,29 +8,14 @@ import 'package:flutter_test/flutter_test.dart';
 
 Uint8List bytes(List<int> b) => Uint8List.fromList(b);
 
-/// One decoded animated-QR data frame.
-class QrFrame {
-  final int nonce;
-  final int totalFrames;
-  final int frameIndex;
-  final Uint8List data;
-
-  QrFrame(this.nonce, this.totalFrames, this.frameIndex, this.data);
-}
-
-/// Reads a frame exactly the way the scanner does.
+/// Reads a frame the way the scanner does — through the same parser.
 ///
-/// Mirrors the header parse in `_handleQrLoopChunk` (lib/scan.dart): one nonce
-/// byte, then two big-endian uint16s, then the chunk. Kept as a copy so the
-/// round-trip test below fails if either side of the wire format moves.
-QrFrame parseDataFrame(String base64Str) {
-  final raw = base64Decode(base64Str);
-  return QrFrame(
-    raw[0],
-    (raw[1] << 8) + raw[2],
-    (raw[3] << 8) + raw[4],
-    Uint8List.fromList(raw.sublist(5)),
-  );
+/// `_handleQrLoopChunk` (lib/scan.dart) calls `QrDataFrame.parse` on exactly
+/// these bytes, so a change to either side of the wire format shows up here.
+QrDataFrame parseDataFrame(String base64Str) {
+  final frame = QrDataFrame.parse(base64Decode(base64Str));
+  expect(frame, isNotNull, reason: 'frame is missing its 5-byte header');
+  return frame!;
 }
 
 /// Runs frames through the real decoder and unwraps the result.
@@ -207,24 +192,23 @@ void main() {
       }
     });
 
-    test('repeats the loop with an incrementing nonce', () {
-      final frames = dataToFrames('x' * 150, loops: 3);
+    test('every frame of a payload carries the same nonce', () {
+      // The scanner reads a nonce change as a new transfer and, while frames
+      // are still arriving, refuses to hand over — so a payload that renumbered
+      // partway through would have its own later frames dropped.
+      final frames = dataToFrames('x' * 1000);
 
-      // 150 + 20 = 170 bytes => 2 chunks per loop.
-      expect(frames.length, 6);
-      expect(frames.map((f) => parseDataFrame(f).nonce), [0, 0, 1, 1, 2, 2]);
-      // Only the nonce changes; the payload of each loop is identical.
-      expect(parseDataFrame(frames[2]).data, parseDataFrame(frames[0]).data);
-      expect(parseDataFrame(frames[5]).data, parseDataFrame(frames[1]).data);
+      expect(frames.length, greaterThan(1));
+      expect(frames.map((f) => parseDataFrame(f).nonce).toSet(), {0});
     });
 
-    test('wraps the nonce at MAX_NONCE', () {
-      final frames = dataToFrames('x', loops: MAX_NONCE + 2);
+    test('never emits the nonce reserved for fountain frames', () {
+      // _ScanState.FOUNTAIN_V1_CONST is 100, and the scanner dispatches on
+      // byte 0 before it knows which kind of frame it holds: a data frame with
+      // that nonce would be parsed as a fountain and dropped.
+      final frames = dataToFrames('x' * 1000);
 
-      expect(frames.length, MAX_NONCE + 2);
-      expect(parseDataFrame(frames[MAX_NONCE - 1]).nonce, MAX_NONCE - 1);
-      expect(parseDataFrame(frames[MAX_NONCE]).nonce, 0);
-      expect(parseDataFrame(frames[MAX_NONCE + 1]).nonce, 1);
+      expect(frames.map((f) => parseDataFrame(f).nonce), isNot(contains(100)));
     });
 
     test('honours a custom dataSize', () {
@@ -277,6 +261,15 @@ void main() {
       expect(decodeFrames(frames.reversed.toList()), data);
     });
 
+    test('the replayed animation decodes the same on every pass', () {
+      // _createFrameStream (lib/ecash_send.dart) cycles this list forever, so
+      // the scanner routinely sees the same frames a second and third time.
+      final data = Uint8List.fromList(utf8.encode('looping payload ' * 10));
+      final frames = dataToFrames(data);
+
+      expect(decodeFrames([...frames, ...frames, ...frames]), data);
+    });
+
     test('duplicate frames do not corrupt the result', () {
       final data = Uint8List.fromList(utf8.encode('duplicated ' * 30));
       final frames = dataToFrames(data);
@@ -314,15 +307,6 @@ void main() {
 
       expect(frames.length, ((20 + data.length) / 3).ceil());
       expect(decodeFrames(frames), data);
-    });
-
-    test('each loop of a repeated animation decodes on its own', () {
-      final data = Uint8List.fromList(utf8.encode('looping payload ' * 10));
-      final frames = dataToFrames(data, loops: 2);
-      final perLoop = frames.length ~/ 2;
-
-      expect(decodeFrames(frames.sublist(0, perLoop)), data);
-      expect(decodeFrames(frames.sublist(perLoop)), data);
     });
 
     test('a corrupted chunk fails the md5 check', () {
