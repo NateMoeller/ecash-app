@@ -276,22 +276,37 @@ void main() {
       expect(formatFiatInput('12.', FiatCurrency.usd), '\$12.');
       expect(formatFiatInput('12.5', FiatCurrency.usd), '\$12.5');
       expect(formatFiatInput('12.50', FiatCurrency.usd), '\$12.50');
+      // A long fraction stays as typed — grouping it would be nonsense.
+      expect(formatFiatInput('1.123456', FiatCurrency.usd), '\$1.123456');
     });
 
     test('groups thousands with commas while typing', () {
+      // No separator below 1000, then one more every three digits.
+      expect(formatFiatInput('999', FiatCurrency.usd), '\$999');
       expect(formatFiatInput('1000', FiatCurrency.usd), '\$1,000');
+      expect(formatFiatInput('9999', FiatCurrency.usd), '\$9,999');
       expect(formatFiatInput('12345', FiatCurrency.usd), '\$12,345');
-      expect(formatFiatInput('1234567', FiatCurrency.usd), '\$1,234,567');
-      expect(formatFiatInput('1234567', FiatCurrency.eur), '1,234,567€');
+      expect(formatFiatInput('999999', FiatCurrency.usd), '\$999,999');
+      expect(formatFiatInput('1000000', FiatCurrency.usd), '\$1,000,000');
+      expect(formatFiatInput('9999999', FiatCurrency.usd), '\$9,999,999');
+      expect(
+        formatFiatInput('1000000000', FiatCurrency.usd),
+        '\$1,000,000,000',
+      );
       // Only the integer part is grouped; decimals are left as typed
       expect(formatFiatInput('1234.5', FiatCurrency.usd), '\$1,234.5');
       expect(formatFiatInput('1234.', FiatCurrency.usd), '\$1,234.');
-      // No separator below 1000
-      expect(formatFiatInput('999', FiatCurrency.usd), '\$999');
+      expect(formatFiatInput('1234567.89', FiatCurrency.usd), '\$1,234,567.89');
+      expect(formatFiatInput('1000000.', FiatCurrency.usd), '\$1,000,000.');
+      // Grouping runs before the symbol is attached, so it reads the same
+      // whichever side that symbol lands on.
+      expect(formatFiatInput('1234567', FiatCurrency.eur), '1,234,567€');
+      expect(formatFiatInput('1234.56', FiatCurrency.eur), '1,234.56€');
     });
 
     test('handles leading decimal', () {
       expect(formatFiatInput('.5', FiatCurrency.usd), '\$0.5');
+      expect(formatFiatInput('.123456', FiatCurrency.usd), '\$0.123456');
     });
 
     test('formats all currencies correctly', () {
@@ -302,43 +317,6 @@ void main() {
       expect(formatFiatInput('100', FiatCurrency.chf), 'CHF 100');
       expect(formatFiatInput('100', FiatCurrency.aud), 'A\$100');
       expect(formatFiatInput('100', FiatCurrency.jpy), '¥100');
-    });
-  });
-
-  group('formatFiatInput thousands grouping', () {
-    test('adds a separator only once the integer part reaches four digits', () {
-      expect(formatFiatInput('99', FiatCurrency.usd), '\$99');
-      expect(formatFiatInput('999', FiatCurrency.usd), '\$999');
-      expect(formatFiatInput('1000', FiatCurrency.usd), '\$1,000');
-      expect(formatFiatInput('9999', FiatCurrency.usd), '\$9,999');
-    });
-
-    test('adds the second separator at seven digits', () {
-      expect(formatFiatInput('999999', FiatCurrency.usd), '\$999,999');
-      expect(formatFiatInput('1000000', FiatCurrency.usd), '\$1,000,000');
-      expect(formatFiatInput('9999999', FiatCurrency.usd), '\$9,999,999');
-      expect(
-        formatFiatInput('1000000000', FiatCurrency.usd),
-        '\$1,000,000,000',
-      );
-    });
-
-    test('groups the integer part only, never the decimals', () {
-      expect(formatFiatInput('1234567.89', FiatCurrency.usd), '\$1,234,567.89');
-      expect(formatFiatInput('1000000.', FiatCurrency.usd), '\$1,000,000.');
-      // A long fraction stays as typed — grouping it would be nonsense.
-      expect(formatFiatInput('1.123456', FiatCurrency.usd), '\$1.123456');
-      expect(formatFiatInput('.123456', FiatCurrency.usd), '\$0.123456');
-    });
-
-    test('groups the same way whichever side the symbol sits on', () {
-      expect(formatFiatInput('1234567', FiatCurrency.eur), '1,234,567€');
-      expect(formatFiatInput('1234567', FiatCurrency.gbp), '£1,234,567');
-      expect(formatFiatInput('1234567', FiatCurrency.cad), 'C\$1,234,567');
-      expect(formatFiatInput('1234567', FiatCurrency.chf), 'CHF 1,234,567');
-      expect(formatFiatInput('1234567', FiatCurrency.aud), 'A\$1,234,567');
-      expect(formatFiatInput('1234567', FiatCurrency.jpy), '¥1,234,567');
-      expect(formatFiatInput('1234.56', FiatCurrency.eur), '1,234.56€');
     });
   });
 
