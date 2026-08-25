@@ -1,5 +1,6 @@
 import 'package:ecashapp/db.dart';
 import 'package:ecashapp/models.dart';
+import 'package:ecashapp/multimint.dart';
 import 'package:ecashapp/utils.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -403,18 +404,35 @@ void main() {
     });
   });
 
-  group('getModuleIdForPaymentType', () {
-    test('maps each payment type to its Fedimint module id', () {
-      expect(getModuleIdForPaymentType(PaymentType.lightning), 0);
-      expect(getModuleIdForPaymentType(PaymentType.ecash), 1);
-      expect(getModuleIdForPaymentType(PaymentType.onchain), 2);
+  group('PaymentType.recoveryModule', () {
+    test('maps each payment type to the module of the same name', () {
+      // The two enums are declared in different orders — PaymentType is
+      // lightning, onchain, ecash and RecoveryModule is lightning, ecash,
+      // onchain — so a switch written against the ordinal instead of the name
+      // would quietly swap the on-chain and ecash bars.
+      expect(PaymentType.lightning.recoveryModule, RecoveryModule.lightning);
+      expect(PaymentType.onchain.recoveryModule, RecoveryModule.onchain);
+      expect(PaymentType.ecash.recoveryModule, RecoveryModule.ecash);
     });
 
-    test('gives every payment type a distinct id', () {
-      final ids = PaymentType.values.map(getModuleIdForPaymentType).toList();
+    test('every payment type resolves to a distinct module', () {
+      // Two payment types landing on one module would show the same recovery
+      // bar under both tabs, which is the bug the per-tab progress map exists
+      // to prevent.
+      final modules = PaymentType.values.map((t) => t.recoveryModule).toList();
 
-      expect(ids.length, PaymentType.values.length);
-      expect(ids.toSet().length, ids.length);
+      expect(modules.length, PaymentType.values.length);
+      expect(modules.toSet().length, modules.length);
+    });
+
+    test('covers every payment type', () {
+      // The switch is total, so this is really a guard against a future
+      // PaymentType arriving with a default arm bolted on to keep it
+      // compiling.
+      expect(
+        PaymentType.values.map((t) => t.recoveryModule),
+        everyElement(isA<RecoveryModule>()),
+      );
     });
   });
 
