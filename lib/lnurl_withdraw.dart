@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:ecashapp/extensions/build_context_l10n.dart';
 import 'package:ecashapp/lib.dart';
+import 'package:ecashapp/lnurl_client.dart';
 import 'package:ecashapp/multimint.dart';
 import 'package:ecashapp/success.dart';
 import 'package:ecashapp/toast.dart';

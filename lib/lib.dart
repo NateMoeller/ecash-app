@@ -7,16 +7,17 @@ import 'app_error.dart';
 import 'db.dart';
 import 'event_bus.dart';
 import 'frb_generated.dart';
+import 'lnurl_client.dart';
 import 'multimint.dart';
 import 'nostr.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'lib.freezed.dart';
 
-// These functions are ignored because they are not marked as `pub`: `build_lnurlw_callback_url`, `create_event_bus`, `create_nostr_client`, `error_to_flutter`, `get_database`, `get_db`, `get_multimint`, `get_nostr_client`, `get_pin_manager`, `get_recovery_relays`, `info_to_flutter`, `lnurl_pay_response`, `nwc_limit_msats`, `parse_ecash`, `parse_lnurl_withdraw_response`, `payment_error_to_flutter`, `verify_current_pin`, `verify_lnurl_invoice`, `write_nwc_limits`
+// These functions are ignored because they are not marked as `pub`: `create_event_bus`, `create_nostr_client`, `error_to_flutter`, `get_database`, `get_db`, `get_multimint`, `get_nostr_client`, `get_pin_manager`, `get_recovery_relays`, `info_to_flutter`, `nwc_limit_msats`, `parse_ecash`, `payment_error_to_flutter`, `verify_current_pin`, `write_nwc_limits`
 // These functions are ignored because they have generic arguments: `balance`, `federations`, `get_invoice_network`, `log_error`, `parse_ecash`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `MultimintParseContext`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `clone`, `eq`, `fmt`, `fmt`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `clone`, `eq`, `fmt`
 
 Future<EventBusMultimintEvent> getEventBus() =>
     RustLib.instance.api.crateGetEventBus();
@@ -145,9 +146,9 @@ Future<String> getInvoiceFromLnaddressOrLnurl({
   lnaddressOrLnurl: lnaddressOrLnurl,
 );
 
-/// Fetch withdraw parameters from a LNURLw HTTPS endpoint (LUD-03 / LUD-17).
-/// Pure read — no side effects. Call this first so the UI can show the
-/// withdraw details and get user confirmation before any money moves.
+/// Fetch withdraw parameters from a LNURLw endpoint — see
+/// [`lnurl_client::fetch_withdraw_params`]. Pure read, no side effects: call it
+/// first so the UI can confirm the withdraw with the user before money moves.
 Future<LnurlWithdrawParams> fetchLnurlWithdraw({required String url}) =>
     RustLib.instance.api.crateFetchLnurlWithdraw(url: url);
 
@@ -811,43 +812,6 @@ abstract class FederationId implements RustOpaqueInterface {}
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<SafeUrl>>
 abstract class SafeUrl implements RustOpaqueInterface {}
-
-/// Parameters returned by a LNURLw (LNURL Withdraw) endpoint.
-/// Shown to the user before they confirm a Boltcard withdraw.
-class LnurlWithdrawParams {
-  final String callback;
-  final String k1;
-  final BigInt minWithdrawableMsats;
-  final BigInt maxWithdrawableMsats;
-  final String defaultDescription;
-
-  const LnurlWithdrawParams({
-    required this.callback,
-    required this.k1,
-    required this.minWithdrawableMsats,
-    required this.maxWithdrawableMsats,
-    required this.defaultDescription,
-  });
-
-  @override
-  int get hashCode =>
-      callback.hashCode ^
-      k1.hashCode ^
-      minWithdrawableMsats.hashCode ^
-      maxWithdrawableMsats.hashCode ^
-      defaultDescription.hashCode;
-
-  @override
-  bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is LnurlWithdrawParams &&
-          runtimeType == other.runtimeType &&
-          callback == other.callback &&
-          k1 == other.k1 &&
-          minWithdrawableMsats == other.minWithdrawableMsats &&
-          maxWithdrawableMsats == other.maxWithdrawableMsats &&
-          defaultDescription == other.defaultDescription;
-}
 
 @freezed
 sealed class ParsedText with _$ParsedText {
