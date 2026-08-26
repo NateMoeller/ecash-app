@@ -248,11 +248,12 @@ class _ScanQRPageState extends State<ScanQRPage> {
         return;
       } else {
         // Data Frame
-        if (bytes.length < 5) return;
-        final nonce = bytes[0];
-        final totalFrames = (bytes[1] << 8) + bytes[2];
-        final frameIndex = (bytes[3] << 8) + bytes[4];
-        final chunkData = bytes.sublist(5);
+        final frame = QrDataFrame.parse(bytes);
+        if (frame == null) return;
+        final nonce = frame.nonce;
+        final totalFrames = frame.totalFrames;
+        final frameIndex = frame.frameIndex;
+        final chunkData = frame.data;
 
         // A zero count completes the session on its first frame and merges to
         // nothing; an enormous one is a memory reservation, not a transfer.
@@ -300,7 +301,7 @@ class _ScanQRPageState extends State<ScanQRPage> {
         }
 
         final session = _currentSession!;
-        if (session.addDataFrame(frameIndex, Uint8List.fromList(chunkData))) {
+        if (session.addDataFrame(frameIndex, chunkData)) {
           setState(() {});
         }
 

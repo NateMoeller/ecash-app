@@ -1,4 +1,6 @@
 import 'package:ecashapp/db.dart';
+import 'package:ecashapp/models.dart';
+import 'package:ecashapp/multimint.dart';
 import 'package:ecashapp/utils.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -189,7 +191,10 @@ void main() {
         '45,000.00€',
       );
       // Below 1000 stays ungrouped
-      expect(calculateFiatValue(50000.0, 1000000, FiatCurrency.usd), '\$500.00');
+      expect(
+        calculateFiatValue(50000.0, 1000000, FiatCurrency.usd),
+        '\$500.00',
+      );
     });
 
     test('calculates EUR correctly with symbol after', () {
@@ -271,22 +276,37 @@ void main() {
       expect(formatFiatInput('12.', FiatCurrency.usd), '\$12.');
       expect(formatFiatInput('12.5', FiatCurrency.usd), '\$12.5');
       expect(formatFiatInput('12.50', FiatCurrency.usd), '\$12.50');
+      // A long fraction stays as typed — grouping it would be nonsense.
+      expect(formatFiatInput('1.123456', FiatCurrency.usd), '\$1.123456');
     });
 
     test('groups thousands with commas while typing', () {
+      // No separator below 1000, then one more every three digits.
+      expect(formatFiatInput('999', FiatCurrency.usd), '\$999');
       expect(formatFiatInput('1000', FiatCurrency.usd), '\$1,000');
+      expect(formatFiatInput('9999', FiatCurrency.usd), '\$9,999');
       expect(formatFiatInput('12345', FiatCurrency.usd), '\$12,345');
-      expect(formatFiatInput('1234567', FiatCurrency.usd), '\$1,234,567');
-      expect(formatFiatInput('1234567', FiatCurrency.eur), '1,234,567€');
+      expect(formatFiatInput('999999', FiatCurrency.usd), '\$999,999');
+      expect(formatFiatInput('1000000', FiatCurrency.usd), '\$1,000,000');
+      expect(formatFiatInput('9999999', FiatCurrency.usd), '\$9,999,999');
+      expect(
+        formatFiatInput('1000000000', FiatCurrency.usd),
+        '\$1,000,000,000',
+      );
       // Only the integer part is grouped; decimals are left as typed
       expect(formatFiatInput('1234.5', FiatCurrency.usd), '\$1,234.5');
       expect(formatFiatInput('1234.', FiatCurrency.usd), '\$1,234.');
-      // No separator below 1000
-      expect(formatFiatInput('999', FiatCurrency.usd), '\$999');
+      expect(formatFiatInput('1234567.89', FiatCurrency.usd), '\$1,234,567.89');
+      expect(formatFiatInput('1000000.', FiatCurrency.usd), '\$1,000,000.');
+      // Grouping runs before the symbol is attached, so it reads the same
+      // whichever side that symbol lands on.
+      expect(formatFiatInput('1234567', FiatCurrency.eur), '1,234,567€');
+      expect(formatFiatInput('1234.56', FiatCurrency.eur), '1,234.56€');
     });
 
     test('handles leading decimal', () {
       expect(formatFiatInput('.5', FiatCurrency.usd), '\$0.5');
+      expect(formatFiatInput('.123456', FiatCurrency.usd), '\$0.123456');
     });
 
     test('formats all currencies correctly', () {
@@ -297,6 +317,100 @@ void main() {
       expect(formatFiatInput('100', FiatCurrency.chf), 'CHF 100');
       expect(formatFiatInput('100', FiatCurrency.aud), 'A\$100');
       expect(formatFiatInput('100', FiatCurrency.jpy), '¥100');
+    });
+  });
+
+  group('redactUriForLog', () {
+    test('keeps the scheme and host but drops path and query', () {
+      final uri = Uri.parse(
+        'lnurlw://service.example.com/withdraw?k1=deadbeefsecret&tag=withdrawRequest',
+      );
+
+      final redacted = redactUriForLog(uri);
+
+      expect(redacted, startsWith('lnurlw://service.example.com<redacted '));
+      expect(redacted, endsWith(' chars>'));
+      // The k1 alone is enough to claim the withdrawal.
+      expect(redacted, isNot(contains('k1')));
+      expect(redacted, isNot(contains('deadbeefsecret')));
+      expect(redacted, isNot(contains('withdraw')));
+    });
+
+    test('reports the length of the original URI', () {
+      // 'lightning:abc' is 13 characters.
+      expect(
+        redactUriForLog(Uri.parse('lightning:abc')),
+        'lightning:<redacted 13 chars>',
+      );
+    });
+
+    test('omits the host marker when there is no host', () {
+      // A bolt11 link is scheme + opaque payload, so there is nothing to keep.
+      final uri = Uri.parse('lightning:lnbc10u1pjq8s2spp5abcdef');
+
+      final redacted = redactUriForLog(uri);
+
+      expect(redacted, startsWith('lightning:<redacted '));
+      expect(redacted, isNot(contains('//')));
+      expect(redacted, isNot(contains('lnbc')));
+    });
+
+    test('handles a scheme with nothing after it', () {
+      expect(
+        redactUriForLog(Uri.parse('lightning:')),
+        'lightning:<redacted 10 chars>',
+      );
+    });
+
+    test('normalizes the scheme to lower case', () {
+      expect(
+        redactUriForLog(Uri.parse('LIGHTNING:abc')),
+        startsWith('lightning:'),
+      );
+    });
+
+    test('drops userinfo, port and fragment along with the rest', () {
+      final uri = Uri.parse('https://user:pw@host.example.com:8443/p?q=1#frag');
+
+      final redacted = redactUriForLog(uri);
+
+      expect(redacted, startsWith('https://host.example.com<redacted '));
+      expect(redacted, isNot(contains('user')));
+      expect(redacted, isNot(contains('pw')));
+      expect(redacted, isNot(contains('8443')));
+      expect(redacted, isNot(contains('frag')));
+    });
+  });
+
+  group('PaymentType.recoveryModule', () {
+    test('maps each payment type to the module of the same name', () {
+      // The two enums are declared in different orders — PaymentType is
+      // lightning, onchain, ecash and RecoveryModule is lightning, ecash,
+      // onchain — so a switch written against the ordinal instead of the name
+      // would quietly swap the on-chain and ecash bars.
+      expect(PaymentType.lightning.recoveryModule, RecoveryModule.lightning);
+      expect(PaymentType.onchain.recoveryModule, RecoveryModule.onchain);
+      expect(PaymentType.ecash.recoveryModule, RecoveryModule.ecash);
+    });
+
+    test('every payment type resolves to a distinct module', () {
+      // Two payment types landing on one module would show the same recovery
+      // bar under both tabs, which is the bug the per-tab progress map exists
+      // to prevent.
+      final modules = PaymentType.values.map((t) => t.recoveryModule).toList();
+
+      expect(modules.length, PaymentType.values.length);
+      expect(modules.toSet().length, modules.length);
+    });
+
+    test('covers every payment type', () {
+      // The switch is total, so this is really a guard against a future
+      // PaymentType arriving with a default arm bolted on to keep it
+      // compiling.
+      expect(
+        PaymentType.values.map((t) => t.recoveryModule),
+        everyElement(isA<RecoveryModule>()),
+      );
     });
   });
 
