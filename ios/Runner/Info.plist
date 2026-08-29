@@ -32,6 +32,7 @@
 				<string>lightning</string>
 				<string>lnurl</string>
 				<string>lnurlp</string>
+				<string>lnurlw</string>
 				<string>bitcoin</string>
 			</array>
 		</dict>
