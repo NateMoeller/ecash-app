@@ -94,7 +94,10 @@ use lightning_invoice::{Bolt11Invoice, Description};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_value, json};
-use tokio::{sync::mpsc::unbounded_channel, time::Instant};
+use tokio::{
+    sync::mpsc::unbounded_channel,
+    time::{sleep, Instant},
+};
 use tokio::{sync::RwLock, time::timeout};
 
 use crate::get_event_bus;
@@ -128,6 +131,21 @@ const VERSION_CHECK_INTERVAL_SECS: u64 = 60 * 60 * 6;
 const CACHE_TASK_STAGE_TIMEOUT_SECS: u64 = 60;
 /// Timeout for the BTC price HTTP request itself.
 const PRICE_FETCH_TIMEOUT_SECS: u64 = 10;
+/// How long the cleanup that follows leaving a federation waits for that
+/// federation's background tasks to actually stop.
+///
+/// They are cancelled at their next await point, so this only has to cover a
+/// task sitting in a blocking section. Nobody is waiting on it — the user was
+/// told the federation was left long before this elapses.
+const LEAVE_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long that same cleanup keeps waiting for the last `ClientHandleArc`
+/// clone to be released before it gives up on an orderly client shutdown.
+///
+/// Generous because the holder is usually an in-flight payment: better to wait
+/// for it to finish than to yank the client out from under it.
+const CLIENT_RELEASE_TIMEOUT: Duration = Duration::from_secs(120);
+/// How often that wait re-checks for sole ownership of the client.
+const CLIENT_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// A gateway routing fee at or above this takes 100% of the payment, which
 /// makes the fee inversion in [`gross_invoice_for_contract`] unsolvable.
 const MAX_GATEWAY_PPM: u64 = 1_000_000;
@@ -292,13 +310,35 @@ pub fn is_mintv2_ecash(ecash: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A joined federation: its client, and the task group owning every background
+/// task that belongs to it.
+///
+/// Deliberately one map entry rather than two parallel maps. The two have
+/// exactly the same lifetime, and keeping them together makes the pairing
+/// structural instead of a rule three call sites have to remember: a client
+/// with no group would spawn its watchers onto nothing, and a group with no
+/// client could never be cancelled. It also means every caller that already
+/// looked up a client to do some work is holding the group it should spawn the
+/// follow-up watcher on, with no second lock to take.
+///
+/// Both fields are reference-counted handles, so cloning one of these is as
+/// cheap as cloning the client used to be.
+#[derive(Clone)]
+pub(crate) struct JoinedFederation {
+    pub(crate) client: ClientHandleArc,
+    pub(crate) tasks: TaskGroup,
+}
+
 #[allow(clippy::type_complexity)]
 #[derive(Clone)]
 pub struct Multimint {
     db: Database,
     mnemonic: Mnemonic,
     modules: ClientModuleInitRegistry,
-    clients: Arc<RwLock<BTreeMap<FederationId, ClientHandleArc>>>,
+    clients: Arc<RwLock<BTreeMap<FederationId, JoinedFederation>>>,
+    /// App-wide task group. Only tasks that outlive every individual federation
+    /// belong here; anything scoped to one federation goes on that federation's
+    /// [`JoinedFederation::tasks`] instead, so that leaving cancels it.
     task_group: TaskGroup,
     /// Per-federation recovery progress, keyed by module instance id so each
     /// module's updates overwrite only its own entry, and tagged with the bar
@@ -991,207 +1031,259 @@ impl Multimint {
                 .await
                 .map(Arc::new)?;
 
-            self.clients.write().await.insert(id.id, client.clone());
+            let tasks = self.task_group.make_subgroup();
+            // A client reopened mid-recovery gets replaced the moment that
+            // recovery finishes, so everything holding it goes on a child group
+            // that `wait_for_recovery` can retire — see `join_federation_inner`.
+            let recovering = client.has_pending_recoveries();
+            let client_tasks = if recovering {
+                tasks.make_subgroup()
+            } else {
+                tasks.clone()
+            };
 
-            self.spawn_lnv2_event_listener(client.clone(), id.id);
-            self.wallet_handler
-                .spawn_v2_deposit_event_listener(client.clone(), id.id);
-            self.finish_active_subscriptions(client.clone(), id.id)
+            self.register_federation(id.id, client.clone(), tasks.clone())
                 .await;
-            if client.has_pending_recoveries() {
-                self.spawn_recovery_progress(client.clone());
+
+            self.spawn_lnv2_event_listener(&client_tasks, client.clone(), id.id);
+            self.wallet_handler.spawn_v2_deposit_event_listener(
+                &client_tasks,
+                client.clone(),
+                id.id,
+            );
+            self.finish_active_subscriptions(&tasks, &client_tasks, client.clone(), id.id);
+            if recovering {
+                self.spawn_recovery_progress(&tasks, &client_tasks, client.clone());
             }
 
-            self.lnv1_update_gateway_cache(&client).await;
+            self.lnv1_update_gateway_cache(&client_tasks, &client);
         }
 
         Ok(())
     }
 
-    async fn finish_active_subscriptions(
+    /// Re-drives operations that were still in flight when the app last closed.
+    ///
+    /// Two groups because the scan and what it starts have different lifetimes.
+    /// The scan reads `client`'s operation log and so belongs to that client,
+    /// on `client_tasks`. The monitors it spawns resolve the client by
+    /// federation id when they run, so they belong to the federation and go on
+    /// `tasks` — which keeps them alive across a recovery client being retired
+    /// and replaced. For every non-recovering client the two are the same group.
+    fn finish_active_subscriptions(
         &self,
+        tasks: &TaskGroup,
+        client_tasks: &TaskGroup,
         client: ClientHandleArc,
         federation_id: FederationId,
     ) {
         let self_copy = self.clone();
-        self.task_group
-            .spawn_cancellable("finish active subscriptions", async move {
-                let active_operations = client.get_active_operations().await;
-                let operation_log = client.operation_log();
-                for op_id in active_operations {
-                    let entry = operation_log.get_operation(op_id).await;
-                    if let Some(entry) = entry {
-                        // Only drive operation to completion if there is no outcome yet
-                        if entry.outcome::<serde_json::Value>().is_none() {
-                            match entry.operation_module_kind() {
-                                // Spawn only the monitor matching the operation's
-                                // direction (like the wallet arms below). Driving
-                                // a send monitor on a receive op (or vice versa)
-                                // resolves to a "no final state" outcome, which
-                                // surfaces a spurious error toast to the user.
-                                "lnv2" => {
-                                    if matches!(
-                                        entry.meta::<LightningOperationMeta>(),
-                                        LightningOperationMeta::Send(_)
-                                    ) {
-                                        self_copy.spawn_await_send(federation_id, op_id);
-                                    } else {
-                                        self_copy.spawn_await_receive(federation_id, op_id);
-                                    }
+        let tasks_copy = tasks.clone();
+        client_tasks.spawn_cancellable("finish active subscriptions", async move {
+            let active_operations = client.get_active_operations().await;
+            let operation_log = client.operation_log();
+            for op_id in active_operations {
+                let entry = operation_log.get_operation(op_id).await;
+                if let Some(entry) = entry {
+                    // Only drive operation to completion if there is no outcome yet
+                    if entry.outcome::<serde_json::Value>().is_none() {
+                        match entry.operation_module_kind() {
+                            // Spawn only the monitor matching the operation's
+                            // direction (like the wallet arms below). Driving
+                            // a send monitor on a receive op (or vice versa)
+                            // resolves to a "no final state" outcome, which
+                            // surfaces a spurious error toast to the user.
+                            "lnv2" => {
+                                if matches!(
+                                    entry.meta::<LightningOperationMeta>(),
+                                    LightningOperationMeta::Send(_)
+                                ) {
+                                    self_copy.spawn_await_send(&tasks_copy, federation_id, op_id);
+                                } else {
+                                    self_copy.spawn_await_receive(
+                                        &tasks_copy,
+                                        federation_id,
+                                        op_id,
+                                    );
                                 }
-                                "ln" => {
-                                    if matches!(
-                                        entry
-                                            .meta::<fedimint_ln_client::LightningOperationMeta>()
-                                            .variant,
-                                        LightningOperationMetaVariant::Pay(_)
-                                    ) {
-                                        self_copy.spawn_await_send(federation_id, op_id);
-                                    } else {
-                                        self_copy.spawn_await_receive(federation_id, op_id);
-                                    }
+                            }
+                            "ln" => {
+                                if matches!(
+                                    entry
+                                        .meta::<fedimint_ln_client::LightningOperationMeta>()
+                                        .variant,
+                                    LightningOperationMetaVariant::Pay(_)
+                                ) {
+                                    self_copy.spawn_await_send(&tasks_copy, federation_id, op_id);
+                                } else {
+                                    self_copy.spawn_await_receive(
+                                        &tasks_copy,
+                                        federation_id,
+                                        op_id,
+                                    );
                                 }
-                                "mint" => {
-                                    if matches!(
-                                        entry.meta::<MintOperationMeta>().variant,
-                                        MintOperationMetaVariant::SpendOOB { .. }
-                                    ) {
-                                        self_copy.spawn_await_ecash_send(federation_id, op_id);
-                                    } else {
-                                        self_copy.spawn_await_ecash_reissue(federation_id, op_id);
-                                    }
+                            }
+                            "mint" => {
+                                if matches!(
+                                    entry.meta::<MintOperationMeta>().variant,
+                                    MintOperationMetaVariant::SpendOOB { .. }
+                                ) {
+                                    self_copy.spawn_await_ecash_send(
+                                        &tasks_copy,
+                                        federation_id,
+                                        op_id,
+                                    );
+                                } else {
+                                    self_copy.spawn_await_ecash_reissue(
+                                        &tasks_copy,
+                                        federation_id,
+                                        op_id,
+                                    );
                                 }
-                                // Deposits/receives are re-driven by the pegin
-                                // monitor (v1) and the deposit event listener
-                                // (v2); in-flight on-chain sends (peg-outs) have
-                                // no other driver, so consume those to completion
-                                // here. (We gate on the op type because awaiting a
-                                // send state on a receive op would never resolve.)
-                                "wallet" => {
-                                    if let WalletOperationMetaVariant::Withdraw { .. } =
-                                        entry.meta::<WalletOperationMeta>().variant
-                                    {
-                                        self_copy.spawn_await_withdraw(federation_id, op_id);
-                                    }
+                            }
+                            // Deposits/receives are re-driven by the pegin
+                            // monitor (v1) and the deposit event listener
+                            // (v2); in-flight on-chain sends (peg-outs) have
+                            // no other driver, so consume those to completion
+                            // here. (We gate on the op type because awaiting a
+                            // send state on a receive op would never resolve.)
+                            "wallet" => {
+                                if let WalletOperationMetaVariant::Withdraw { .. } =
+                                    entry.meta::<WalletOperationMeta>().variant
+                                {
+                                    self_copy.spawn_await_withdraw(
+                                        &tasks_copy,
+                                        federation_id,
+                                        op_id,
+                                    );
                                 }
-                                "walletv2" => {
-                                    if let WalletV2OperationMeta::Send(_) =
-                                        entry.meta::<WalletV2OperationMeta>()
-                                    {
-                                        self_copy.spawn_await_withdraw(federation_id, op_id);
-                                    }
+                            }
+                            "walletv2" => {
+                                if let WalletV2OperationMeta::Send(_) =
+                                    entry.meta::<WalletV2OperationMeta>()
+                                {
+                                    self_copy.spawn_await_withdraw(
+                                        &tasks_copy,
+                                        federation_id,
+                                        op_id,
+                                    );
                                 }
-                                module => {
+                            }
+                            module => {
+                                info_to_flutter(format!(
+                                    "Active operation needs to be driven to completion: {module}"
+                                ))
+                                .await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn spawn_lnv2_event_listener(
+        &self,
+        tasks: &TaskGroup,
+        client: ClientHandleArc,
+        federation_id: FederationId,
+    ) {
+        let event_bus = get_event_bus();
+        let mut log_event_added_rx = client.log_event_added_rx();
+        tasks.spawn_cancellable("lnv2 event listener", async move {
+            info_to_flutter(format!(
+                "Spawning LNv2 event listener for federation {federation_id}"
+            ))
+            .await;
+
+            // Start cursor at the end of the existing log so we only process new events
+            let mut position = client.get_next_event_log_id().await;
+
+            loop {
+                // Block until new events are added to the persistent log
+                if log_event_added_rx.changed().await.is_err() {
+                    info_to_flutter(format!(
+                        "LNv2 event listener channel closed for {federation_id}"
+                    ))
+                    .await;
+                    break;
+                }
+
+                // Read all new events from our cursor position
+                let batch = client.get_event_log(Some(position), 100).await;
+
+                for event in &batch {
+                    // The "payment-receive" event kind is shared with mintv2,
+                    // so filter on the lnv2 module before decoding/awaiting.
+                    if event.module_kind() != Some(&fedimint_lnv2_common::KIND)
+                        || event.kind != ReceivePaymentEvent::KIND
+                    {
+                        position = event.id().saturating_add(1);
+                        continue;
+                    }
+
+                    if let Some(receive_event) =
+                        event.to_event::<ReceivePaymentEvent>()
+                    {
+                        // fedimint reports `amount` as the gross invoice and
+                        // `fee` as the gateway's cut, with `amount = contract +
+                        // fee` by construction (lnv2 PR #8741). `amount - fee`
+                        // is therefore always the incoming-contract amount
+                        // credited, with no need to second-guess the value:
+                        // it cancels back to the contract amount even when a
+                        // recurring daemon older than #8741 leaves a real
+                        // timestamp in the fee-encoded expiration field (which
+                        // otherwise inflates fedimint's `fee`/`amount` toward
+                        // u64::MAX), and for pre-#8741 events where `fee`
+                        // defaults to zero.
+                        let amount_msats = receive_event
+                            .amount
+                            .msats
+                            .saturating_sub(receive_event.fee.msats);
+                        let operation_id = receive_event.operation_id;
+                        info_to_flutter(format!(
+                            "LNv2 receive event: {amount_msats} msats, op={operation_id:?} for {federation_id}"
+                        ))
+                        .await;
+
+                        // Wait for the claim to finalize before notifying
+                        if let Ok(lnv2) = client.get_first_module::<fedimint_lnv2_client::LightningClientModule>() {
+                            match lnv2.await_final_receive_operation_state(operation_id).await {
+                                Ok(FinalReceiveOperationState::Claimed) => {
                                     info_to_flutter(format!(
-                                        "Active operation needs to be driven to completion: {module}"
+                                        "LNv2 receive claimed: {amount_msats} msats for {federation_id}"
+                                    ))
+                                    .await;
+                                    let lightning_event =
+                                        LightningEventKind::InvoicePaid(InvoicePaidEvent {
+                                            amount_msats,
+                                        });
+                                    let multimint_event =
+                                        MultimintEvent::Lightning((federation_id, lightning_event));
+                                    event_bus.publish(multimint_event).await;
+                                }
+                                Ok(state) => {
+                                    // A non-claimed receive (e.g. expired invoice) is
+                                    // normal user behavior, so we only log it rather than
+                                    // surfacing a toast.
+                                    info_to_flutter(format!(
+                                        "LNv2 receive ended in non-claimed state: {state:?} for {federation_id}"
+                                    ))
+                                    .await;
+                                }
+                                Err(e) => {
+                                    error_to_flutter(format!(
+                                        "LNv2 receive await error: {e:?} for {federation_id}"
                                     ))
                                     .await;
                                 }
                             }
                         }
                     }
+                    position = event.id().saturating_add(1);
                 }
-            });
-    }
-
-    fn spawn_lnv2_event_listener(&self, client: ClientHandleArc, federation_id: FederationId) {
-        let event_bus = get_event_bus();
-        let mut log_event_added_rx = client.log_event_added_rx();
-        self.task_group
-            .spawn_cancellable("lnv2 event listener", async move {
-                info_to_flutter(format!(
-                    "Spawning LNv2 event listener for federation {federation_id}"
-                ))
-                .await;
-
-                // Start cursor at the end of the existing log so we only process new events
-                let mut position = client.get_next_event_log_id().await;
-
-                loop {
-                    // Block until new events are added to the persistent log
-                    if log_event_added_rx.changed().await.is_err() {
-                        info_to_flutter(format!(
-                            "LNv2 event listener channel closed for {federation_id}"
-                        ))
-                        .await;
-                        break;
-                    }
-
-                    // Read all new events from our cursor position
-                    let batch = client.get_event_log(Some(position), 100).await;
-
-                    for event in &batch {
-                        // The "payment-receive" event kind is shared with mintv2,
-                        // so filter on the lnv2 module before decoding/awaiting.
-                        if event.module_kind() != Some(&fedimint_lnv2_common::KIND)
-                            || event.kind != ReceivePaymentEvent::KIND
-                        {
-                            position = event.id().saturating_add(1);
-                            continue;
-                        }
-
-                        if let Some(receive_event) =
-                            event.to_event::<ReceivePaymentEvent>()
-                        {
-                            // fedimint reports `amount` as the gross invoice and
-                            // `fee` as the gateway's cut, with `amount = contract +
-                            // fee` by construction (lnv2 PR #8741). `amount - fee`
-                            // is therefore always the incoming-contract amount
-                            // credited, with no need to second-guess the value:
-                            // it cancels back to the contract amount even when a
-                            // recurring daemon older than #8741 leaves a real
-                            // timestamp in the fee-encoded expiration field (which
-                            // otherwise inflates fedimint's `fee`/`amount` toward
-                            // u64::MAX), and for pre-#8741 events where `fee`
-                            // defaults to zero.
-                            let amount_msats = receive_event
-                                .amount
-                                .msats
-                                .saturating_sub(receive_event.fee.msats);
-                            let operation_id = receive_event.operation_id;
-                            info_to_flutter(format!(
-                                "LNv2 receive event: {amount_msats} msats, op={operation_id:?} for {federation_id}"
-                            ))
-                            .await;
-
-                            // Wait for the claim to finalize before notifying
-                            if let Ok(lnv2) = client.get_first_module::<fedimint_lnv2_client::LightningClientModule>() {
-                                match lnv2.await_final_receive_operation_state(operation_id).await {
-                                    Ok(FinalReceiveOperationState::Claimed) => {
-                                        info_to_flutter(format!(
-                                            "LNv2 receive claimed: {amount_msats} msats for {federation_id}"
-                                        ))
-                                        .await;
-                                        let lightning_event =
-                                            LightningEventKind::InvoicePaid(InvoicePaidEvent {
-                                                amount_msats,
-                                            });
-                                        let multimint_event =
-                                            MultimintEvent::Lightning((federation_id, lightning_event));
-                                        event_bus.publish(multimint_event).await;
-                                    }
-                                    Ok(state) => {
-                                        // A non-claimed receive (e.g. expired invoice) is
-                                        // normal user behavior, so we only log it rather than
-                                        // surfacing a toast.
-                                        info_to_flutter(format!(
-                                            "LNv2 receive ended in non-claimed state: {state:?} for {federation_id}"
-                                        ))
-                                        .await;
-                                    }
-                                    Err(e) => {
-                                        error_to_flutter(format!(
-                                            "LNv2 receive await error: {e:?} for {federation_id}"
-                                        ))
-                                        .await;
-                                    }
-                                }
-                            }
-                        }
-                        position = event.id().saturating_add(1);
-                    }
-                }
-            });
+            }
+        });
     }
 
     pub async fn contains_client(&self, federation_id: &FederationId) -> bool {
@@ -1206,8 +1298,8 @@ impl Multimint {
     /// already-live connections are no-ops and failures back off internally.
     pub async fn refresh_connections(&self) {
         let clients = self.clients.read().await;
-        for client in clients.values() {
-            client.federation_reconnect();
+        for joined in clients.values() {
+            joined.client.federation_reconnect();
         }
     }
 
@@ -1229,17 +1321,29 @@ impl Multimint {
         // Sometimes we want to get the federation meta before we've joined (i.e to show a preview).
         // In this case, we create a temprorary client and retrieve all the data
         let federation_id = invite_code.federation_id();
-        let maybe_client = self.clients.read().await.get(&federation_id).cloned();
-        let client = if let Some(client) = maybe_client {
-            if !client.has_pending_recoveries() {
-                client
-            } else {
-                self.build_client(&federation_id, &invite_code, ClientType::Temporary)
-                    .await?
-            }
-        } else {
-            self.build_client(&federation_id, &invite_code, ClientType::Temporary)
+        let maybe_client = self
+            .clients
+            .read()
+            .await
+            .get(&federation_id)
+            .map(|joined| joined.client.clone());
+        let client = match maybe_client {
+            Some(client) if !client.has_pending_recoveries() => client,
+            // A preview client is never published to the client map, so there
+            // is no federation entry to take a task group from. `build_client`
+            // only touches the group on the `Recovery` and `New` paths, so the
+            // one passed here is never used — hence the app-wide group rather
+            // than a subgroup, which this preview-heavy path would otherwise
+            // mint (and leave registered with the parent) on every call.
+            _ => {
+                self.build_client(
+                    &federation_id,
+                    &invite_code,
+                    ClientType::Temporary,
+                    &self.task_group,
+                )
                 .await?
+            }
         };
 
         Ok((client, federation_id))
@@ -1319,7 +1423,12 @@ impl Multimint {
                             }
                         }
 
-                        let client = self_copy.clients.read().await.get(&federation_id).cloned();
+                        let client = self_copy
+                            .clients
+                            .read()
+                            .await
+                            .get(&federation_id)
+                            .map(|joined| joined.client.clone());
                         let Some(client) = client else { continue };
 
                         if !client.has_pending_recoveries() {
@@ -1447,7 +1556,12 @@ impl Multimint {
         // (a guardian round-trip that retries against offline peers) would block
         // `join_federation`'s `clients.write()`, and tokio's write-preferring
         // RwLock would then stall every other reader too.
-        let client = self.clients.read().await.get(federation_id).cloned();
+        let client = self
+            .clients
+            .read()
+            .await
+            .get(federation_id)
+            .map(|joined| joined.client.clone());
         let Some(client) = client else { return };
 
         if client.has_pending_recoveries() {
@@ -1579,6 +1693,7 @@ impl Multimint {
                 let client = clients
                     .get(&federation_id)
                     .ok_or(anyhow!("No federation exists"))?
+                    .client
                     .clone();
                 (client, federation_id)
             }
@@ -1624,6 +1739,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or(anyhow!("Federation does not exist"))?
+            .client
             .clone();
         Ok(self
             .cache_federation_meta(client, std::time::SystemTime::now())
@@ -1827,6 +1943,7 @@ impl Multimint {
                 clients
                     .get(&federation_id)
                     .ok_or(anyhow!("No federation exists"))?
+                    .client
                     .clone()
             }
         };
@@ -1943,13 +2060,88 @@ impl Multimint {
         let invite_code = InviteCode::from_str(&invite)?;
         let federation_id = invite_code.federation_id();
 
-        let client = if recover {
-            self.build_client(&federation_id, &invite_code, ClientType::Recovery)
-                .await?
+        // An already-joined federation keeps the group it has rather than
+        // getting a fresh one, so that tasks belonging to it are never split
+        // across two groups.
+        let existing = self
+            .clients
+            .read()
+            .await
+            .get(&federation_id)
+            .map(|joined| joined.tasks.clone());
+        let minted_tasks = existing.is_none();
+        let tasks = existing.unwrap_or_else(|| self.task_group.make_subgroup());
+
+        self.join_federation_on(invite_code, recover, tasks, minted_tasks)
+            .await
+    }
+
+    /// Joins onto a task group chosen by the caller.
+    ///
+    /// `minted_tasks` says whether that group was created for this join, and so
+    /// whether a failed join should shut it down. The recovery re-join passes
+    /// `false`: it hands over the group it took from the federation it just
+    /// retired, and `wait_for_recovery` is itself running on that group.
+    async fn join_federation_on(
+        &mut self,
+        invite_code: InviteCode,
+        recover: bool,
+        tasks: TaskGroup,
+        minted_tasks: bool,
+    ) -> anyhow::Result<FederationSelector> {
+        let federation_id = invite_code.federation_id();
+        let result = self
+            .join_federation_inner(federation_id, invite_code, recover, &tasks)
+            .await;
+
+        if result.is_err() {
+            if minted_tasks {
+                tasks.shutdown();
+            }
+            return result;
+        }
+
+        // Mirror of the stop in `leave_federation`. The pairing row outlives a
+        // leave on purpose, so a federation joined with one still on file needs
+        // its listener started again.
+        get_nostr_client()
+            .read()
+            .await
+            .restart_nwc_listener(&federation_id)
+            .await;
+
+        result
+    }
+
+    async fn join_federation_inner(
+        &mut self,
+        federation_id: FederationId,
+        invite_code: InviteCode,
+        recover: bool,
+        tasks: &TaskGroup,
+    ) -> anyhow::Result<FederationSelector> {
+        // Everything that holds *this particular client* goes on `client_tasks`.
+        //
+        // For a recovery join that is a child of the federation's group, because
+        // this client is temporary: `wait_for_recovery` opens a replacement over
+        // the same client database once recovery finishes, and it has to be able
+        // to retire this one — watchers and all — before it does. For every
+        // other join the client lives as long as the federation does, so the two
+        // groups are the same.
+        let client_tasks = if recover {
+            tasks.make_subgroup()
         } else {
-            self.build_client(&federation_id, &invite_code, ClientType::New)
-                .await?
+            tasks.clone()
         };
+
+        let client_type = if recover {
+            ClientType::Recovery
+        } else {
+            ClientType::New
+        };
+        let client = self
+            .build_client(&federation_id, &invite_code, client_type, &client_tasks)
+            .await?;
 
         let client_config = client.config().await;
         let federation_name = client_config
@@ -1967,14 +2159,19 @@ impl Multimint {
             client_config: client_config.clone(),
         };
 
-        self.clients
-            .write()
-            .await
-            .insert(federation_id, client.clone());
+        self.register_federation(federation_id, client.clone(), tasks.clone())
+            .await;
 
-        self.wallet_handler
-            .spawn_v2_deposit_event_listener(client.clone(), federation_id);
-        self.spawn_lnv2_event_listener(client, federation_id);
+        self.wallet_handler.spawn_v2_deposit_event_listener(
+            &client_tasks,
+            client.clone(),
+            federation_id,
+        );
+        self.spawn_lnv2_event_listener(&client_tasks, client.clone(), federation_id);
+
+        if recover {
+            self.spawn_recovery_progress(tasks, &client_tasks, client);
+        }
 
         let mut dbtx = self.db.begin_transaction().await;
         dbtx.insert_entry(
@@ -1991,6 +2188,55 @@ impl Multimint {
         })
     }
 
+    /// Publishes a client and its task group as the joined federation for
+    /// `federation_id`.
+    ///
+    /// An entry can be replaced rather than added: `wait_for_recovery` re-joins
+    /// the federation it just finished recovering, swapping the recovery client
+    /// for a freshly opened one. The group is the same one either way (see
+    /// `join_federation`), so only the client is displaced.
+    ///
+    /// The displaced client is simply dropped here. Its watchers are still
+    /// running on the shared group and still hold it, so it stays alive until
+    /// the federation is left — at which point cancelling that group releases
+    /// the last reference and `ClientHandle`'s own `Drop` stops its executor.
+    /// Shutting it down here instead would mean either cancelling watchers that
+    /// belong to the live client too, or spinning for two minutes on a
+    /// reference that is held on purpose.
+    async fn register_federation(
+        &self,
+        federation_id: FederationId,
+        client: ClientHandleArc,
+        tasks: TaskGroup,
+    ) {
+        let replaced = self
+            .clients
+            .write()
+            .await
+            .insert(federation_id, JoinedFederation { client, tasks });
+
+        if replaced.is_some() {
+            info_to_flutter(format!(
+                "Replaced the client for {federation_id}; the old one retires with its watchers"
+            ))
+            .await;
+        }
+    }
+
+    /// Leaves a federation.
+    ///
+    /// Returns as soon as the federation is gone from the app's point of view:
+    /// its config row is deleted, its client is out of the map, and its task
+    /// group has been detached, so nothing can route to it or spawn onto it any
+    /// more. The teardown that actually takes time — cancelling the
+    /// federation's background tasks, waiting for them to release their client
+    /// references, and shutting the client down so its own executor stops —
+    /// runs on a detached task afterwards. Leaving should never make the user
+    /// watch a spinner.
+    ///
+    /// Every other persisted row is deliberately kept. The client database, the
+    /// Lightning Address registration, the NWC pairing and the cached metadata
+    /// are all reused if the user joins this federation again.
     pub async fn leave_federation(&mut self, federation_id: &FederationId) {
         // Config first, client second. `federations()` walks the persisted
         // configs and looks each one up in the client map, so removing the
@@ -2002,7 +2248,139 @@ impl Multimint {
         dbtx.remove_entry(&FederationConfigKey { id: *federation_id })
             .await;
         dbtx.commit_tx().await;
-        self.clients.write().await.remove(federation_id);
+        // One removal for both halves — the whole point of keeping them in one
+        // entry. From here on nothing can reach the client or spawn onto the
+        // group.
+        let joined = self.clients.write().await.remove(federation_id);
+
+        // The NWC listener lives on the Nostr client's own task group, not this
+        // federation's, so nothing above reaches it. Only the listener is
+        // stopped; its pairing row stays, so re-joining reconnects with the
+        // credentials the user already handed out.
+        get_nostr_client()
+            .read()
+            .await
+            .stop_nwc_listener(federation_id)
+            .await;
+
+        self.recovery_progress.write().await.remove(federation_id);
+        self.wallet_handler.forget_federation(federation_id).await;
+
+        self.spawn_federation_teardown(*federation_id, joined);
+    }
+
+    /// Cancels a retired federation's background tasks and shuts its client
+    /// down, on a detached task.
+    ///
+    /// Detached because none of it is quick and nobody is waiting: leaving has
+    /// already reported success, and a replaced client has already been
+    /// superseded. Runs on the app-wide group rather than on the federation's
+    /// own, which is the group it is about to cancel.
+    fn spawn_federation_teardown(
+        &self,
+        federation_id: FederationId,
+        joined: Option<JoinedFederation>,
+    ) {
+        let Some(JoinedFederation { client, tasks }) = joined else {
+            return;
+        };
+
+        self.task_group
+            .spawn_cancellable("federation teardown", async move {
+                if let Err(e) = tasks.shutdown_join_all(LEAVE_TASK_JOIN_TIMEOUT).await {
+                    info_to_flutter(format!(
+                        "Not every background task for {federation_id} stopped cleanly: {e}"
+                    ))
+                    .await;
+                }
+
+                Self::shutdown_client(federation_id, client).await;
+
+                info_to_flutter(format!("Finished tearing down {federation_id}")).await;
+            });
+    }
+
+    /// Retires a finished recovery client, returning the federation's task group
+    /// so the replacement can be registered back onto it.
+    ///
+    /// Shuts down everything that holds the client, then takes the federation
+    /// out of the map — which drops the map's handle and leaves this call the
+    /// sole owner — and shuts the client itself down. Only then is it safe to
+    /// open the replacement over the same client database.
+    ///
+    /// The federation has no client for as long as the shutdown and the re-open
+    /// take, a fraction of a second at the tail of a recovery that has already
+    /// run for seconds. `federations()` skips a config whose client is missing,
+    /// so it is briefly absent from the list rather than half-present. If the
+    /// re-join then fails, the caller's error surfaces through
+    /// `spawn_recovery_progress` and the federation is left with its config but
+    /// no client until the next launch, which `load_clients` repairs.
+    async fn retire_recovery_client(
+        &self,
+        federation_id: FederationId,
+        client_tasks: TaskGroup,
+        recovering_client: ClientHandleArc,
+    ) -> anyhow::Result<TaskGroup> {
+        if let Err(e) = client_tasks
+            .shutdown_join_all(LEAVE_TASK_JOIN_TIMEOUT)
+            .await
+        {
+            info_to_flutter(format!(
+                "Recovery watchers for {federation_id} did not all stop cleanly: {e}"
+            ))
+            .await;
+        }
+
+        let Some(JoinedFederation { tasks, .. }) =
+            self.clients.write().await.remove(&federation_id)
+        else {
+            bail!("Federation {federation_id} was left while its recovery was finishing");
+        };
+
+        Self::shutdown_client(federation_id, recovering_client).await;
+        info_to_flutter(format!(
+            "Retired the recovery client for {federation_id}; reopening"
+        ))
+        .await;
+
+        Ok(tasks)
+    }
+
+    /// Shuts a left federation's client down, so the client's own executor and
+    /// task group stop along with ours.
+    ///
+    /// A `ClientHandle` only shuts down when its last handle is dropped, and
+    /// short-lived clones outlive the federation's task group by design — an
+    /// in-flight payment or a Dart-driven stream can still be holding one when
+    /// the user leaves. So this waits for sole ownership rather than assuming
+    /// it, and if a clone is somehow never released it drops the handle anyway:
+    /// `ClientHandle`'s own `Drop` stops the executor, which is the outcome
+    /// that matters.
+    async fn shutdown_client(federation_id: FederationId, mut client: ClientHandleArc) {
+        let deadline = Instant::now() + CLIENT_RELEASE_TIMEOUT;
+        loop {
+            match Arc::try_unwrap(client) {
+                Ok(handle) => {
+                    handle.shutdown().await;
+                    info_to_flutter(format!("Shut down client for {federation_id}")).await;
+                    return;
+                }
+                Err(still_shared) => client = still_shared,
+            }
+
+            if Instant::now() >= deadline {
+                error_to_flutter(format!(
+                    "Client for {federation_id} still has {} references after {}s; dropping it \
+                     and leaving shutdown to the handle itself",
+                    Arc::strong_count(&client) - 1,
+                    CLIENT_RELEASE_TIMEOUT.as_secs(),
+                ))
+                .await;
+                return;
+            }
+
+            sleep(CLIENT_RELEASE_POLL_INTERVAL).await;
+        }
     }
 
     async fn build_client(
@@ -2010,6 +2388,7 @@ impl Multimint {
         federation_id: &FederationId,
         invite_code: &InviteCode,
         client_type: ClientType,
+        tasks: &TaskGroup,
     ) -> anyhow::Result<ClientHandleArc> {
         info_to_flutter(format!("Building new client. type: {client_type}")).await;
         let connectors = ConnectorRegistry::build_from_client_defaults()
@@ -2053,7 +2432,6 @@ impl Multimint {
                     )
                     .await
                     .map(Arc::new)?;
-                self.spawn_recovery_progress(client.clone());
                 client
             }
             client_type => {
@@ -2089,7 +2467,7 @@ impl Multimint {
                 .map(Arc::new)?;
 
                 if client_type == ClientType::New {
-                    self.lnv1_update_gateway_cache(&client).await;
+                    self.lnv1_update_gateway_cache(tasks, &client);
                 }
 
                 client
@@ -2099,57 +2477,74 @@ impl Multimint {
         Ok(client)
     }
 
-    fn spawn_recovery_progress(&self, client: ClientHandleArc) {
+    /// Watches a recovering client and reports its progress.
+    ///
+    /// Takes the federation's task group rather than looking it up, and stays
+    /// synchronous deliberately: the task it spawns re-joins the federation once
+    /// recovery finishes, so `wait_for_recovery -> join_federation ->
+    /// build_client -> spawn_recovery_progress` is a cycle. Spawning from a
+    /// non-`async` function keeps the spawned future's `Send` obligation out of
+    /// `build_client`'s own, which is what stops that cycle from becoming an
+    /// unsolvable auto-trait bound.
+    fn spawn_recovery_progress(
+        &self,
+        tasks: &TaskGroup,
+        client_tasks: &TaskGroup,
+        client: ClientHandleArc,
+    ) {
         let mut self_copy = self.clone();
         let recovering_client = client.clone();
-        self.task_group
-            .spawn_cancellable("wait for recovery", async move {
-                if let Err(e) = self_copy.wait_for_recovery(recovering_client).await {
-                    error_to_flutter(format!("Error waiting for recovery: {e:?}")).await;
-                }
-            });
+        let client_tasks_copy = client_tasks.clone();
+        // On the federation's group rather than the client's: this is the task
+        // that retires the recovery client, so it has to outlive it.
+        tasks.spawn_cancellable("wait for recovery", async move {
+            if let Err(e) = self_copy
+                .wait_for_recovery(client_tasks_copy, recovering_client)
+                .await
+            {
+                error_to_flutter(format!("Error waiting for recovery: {e:?}")).await;
+            }
+        });
 
         let progress_copy = self.clone();
-        self.task_group
-            .spawn_cancellable("recovery progress", async move {
-                progress_copy
-                    .init_recovery_progress_cache(client.federation_id())
-                    .await;
+        // On the client's group: it streams that client's progress and holds it.
+        client_tasks.spawn_cancellable("recovery progress", async move {
+            progress_copy
+                .init_recovery_progress_cache(client.federation_id())
+                .await;
 
-                // Instance ids are assigned per federation, so the mapping has
-                // to come from this client's config rather than a fixed layout.
-                let recovery_modules: BTreeMap<ModuleInstanceId, RecoveryModule> = client
-                    .config()
-                    .await
-                    .modules
-                    .iter()
-                    .filter_map(|(id, module)| {
-                        recovery_module_for_kind(&module.kind).map(|m| (*id, m))
-                    })
-                    .collect();
+            // Instance ids are assigned per federation, so the mapping has
+            // to come from this client's config rather than a fixed layout.
+            let recovery_modules: BTreeMap<ModuleInstanceId, RecoveryModule> = client
+                .config()
+                .await
+                .modules
+                .iter()
+                .filter_map(|(id, module)| recovery_module_for_kind(&module.kind).map(|m| (*id, m)))
+                .collect();
 
-                let mut stream = client.subscribe_to_recovery_progress();
-                while let Some((module_id, progress)) = stream.next().await {
-                    // Kinds with no bar of their own (`meta`) still recover and
-                    // still report; they just have nowhere to be shown.
-                    let Some(recovery_module) = recovery_modules.get(&module_id).copied() else {
-                        continue;
-                    };
-
-                    progress_copy
-                        .update_recovery_progress_cache(
-                            &client.federation_id(),
-                            module_id,
-                            recovery_module,
-                            progress,
-                        )
-                        .await;
-                }
+            let mut stream = client.subscribe_to_recovery_progress();
+            while let Some((module_id, progress)) = stream.next().await {
+                // Kinds with no bar of their own (`meta`) still recover and
+                // still report; they just have nowhere to be shown.
+                let Some(recovery_module) = recovery_modules.get(&module_id).copied() else {
+                    continue;
+                };
 
                 progress_copy
-                    .remove_recovery_progress_cache(&client.federation_id())
+                    .update_recovery_progress_cache(
+                        &client.federation_id(),
+                        module_id,
+                        recovery_module,
+                        progress,
+                    )
                     .await;
-            });
+            }
+
+            progress_copy
+                .remove_recovery_progress_cache(&client.federation_id())
+                .await;
+        });
     }
 
     async fn init_recovery_progress_cache(&self, federation_id: FederationId) {
@@ -2206,27 +2601,40 @@ impl Multimint {
 
     async fn wait_for_recovery(
         &mut self,
+        client_tasks: TaskGroup,
         recovering_client: ClientHandleArc,
     ) -> anyhow::Result<()> {
         let federation_id = recovering_client.federation_id();
         info_to_flutter("Waiting for all recoveries...").await;
         recovering_client.wait_for_all_recoveries().await?;
 
-        // Try all federation invite codes in case some peers are down
+        // Pick an invite code while the recovery client is still up — it is the
+        // only thing that knows the peers' codes, and it is about to be retired.
+        // Try them all in case some peers are down.
         let config = recovering_client.config().await;
-        let peers = config.global.api_endpoints.keys().collect::<Vec<_>>();
-        let mut joined = false;
-        for peer in peers {
-            if let Some(invite_code) = recovering_client.invite_code(*peer).await {
-                self.join_federation(invite_code.to_string(), false).await?;
-                joined = true;
+        let mut invite_code = None;
+        for peer in config.global.api_endpoints.keys() {
+            if let Some(code) = recovering_client.invite_code(*peer).await {
+                invite_code = Some(code);
                 break;
             }
         }
-
-        if !joined {
+        let Some(invite_code) = invite_code else {
             bail!("Could not re-join federation after recovering");
-        }
+        };
+
+        // Retire this client *before* opening its replacement, never after. The
+        // two would be views of the same client database — `with_prefix` is a
+        // key namespace, not a separate database — so both would commit to the
+        // same keys, and fedimint's best-effort background writers (the cached
+        // API version set among them) use the non-retrying `commit_tx`, which
+        // panics on the resulting `WriteConflict` instead of backing off.
+        let tasks = self
+            .retire_recovery_client(federation_id, client_tasks, recovering_client)
+            .await?;
+
+        self.join_federation_on(invite_code, false, tasks, false)
+            .await?;
 
         let new_client = self
             .clients
@@ -2234,6 +2642,7 @@ impl Multimint {
             .await
             .get(&federation_id)
             .expect("Client should be available")
+            .client
             .clone();
         info_to_flutter("Waiting for all active state machines...").await;
         new_client.wait_for_all_active_state_machines().await?;
@@ -2273,7 +2682,11 @@ impl Multimint {
                     // Belt and braces alongside the removal order in
                     // `leave_federation`: a config with no client is skipped
                     // rather than panicking the whole listing.
-                    let client = clients_clone.read().await.get(&id.id).cloned()?;
+                    let client = clients_clone
+                        .read()
+                        .await
+                        .get(&id.id)
+                        .map(|joined| joined.client.clone())?;
                     let selector = FederationSelector {
                         federation_name: config.federation_name,
                         federation_id: id.id,
@@ -2344,7 +2757,7 @@ impl Multimint {
             .read()
             .await
             .get(federation_id)
-            .cloned()
+            .map(|joined| joined.client.clone())
             .ok_or(anyhow!("No federation exists"))?;
         Ok(client.get_balance_for_btc().await?.msats)
     }
@@ -2386,6 +2799,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or_else(|| anyhow!("No federation exists"))?
+            .client
             .clone();
         let balance = client.get_balance_for_btc().await?;
         let too_low = || anyhow!("Balance is too low to send any amount after fees");
@@ -2472,7 +2886,7 @@ impl Multimint {
         let gateway_fee = Amount::from_msats(gateway_fee_msats);
         info_to_flutter(format!("Amount with fees: {amount_with_fees:?}")).await;
         info_to_flutter(format!("Amount without fees: {amount_without_fees:?}")).await;
-        let client = self
+        let JoinedFederation { client, tasks } = self
             .clients
             .read()
             .await
@@ -2492,7 +2906,7 @@ impl Multimint {
             .await
             {
                 info_to_flutter("Using LNv2 for the actual invoice").await;
-                self.spawn_await_receive(*federation_id, operation_id);
+                self.spawn_await_receive(&tasks, *federation_id, operation_id);
                 return Ok((invoice, operation_id));
             }
         }
@@ -2509,50 +2923,59 @@ impl Multimint {
         .await?;
 
         // Spawn new task that awaits the payment in case the user clicks away
-        self.spawn_await_receive(*federation_id, operation_id);
+        self.spawn_await_receive(&tasks, *federation_id, operation_id);
 
         Ok((invoice, operation_id))
     }
 
-    fn spawn_await_receive(&self, federation_id: FederationId, operation_id: OperationId) {
+    fn spawn_await_receive(
+        &self,
+        tasks: &TaskGroup,
+        federation_id: FederationId,
+        operation_id: OperationId,
+    ) {
         let self_copy = self.clone();
-        self.task_group
-            .spawn_cancellable("await receive", async move {
-                // Check if this is an LNv1 operation. LNv2 receive notifications
-                // are handled by the event listener, so we only publish to the
-                // EventBus for LNv1 receives.
-                let is_lnv1 = {
-                    // Federation left while this watcher was running. Nothing
-                    // left to report to, so end the task instead of panicking it.
-                    let Some(client) = self_copy.clients.read().await.get(&federation_id).cloned()
-                    else {
-                        return;
-                    };
-                    client
-                        .operation_log()
-                        .get_operation(operation_id)
-                        .await
-                        .map(|entry| entry.operation_module_kind() == "ln")
-                        .unwrap_or(false)
+        tasks.spawn_cancellable("await receive", async move {
+            // Check if this is an LNv1 operation. LNv2 receive notifications
+            // are handled by the event listener, so we only publish to the
+            // EventBus for LNv1 receives.
+            let is_lnv1 = {
+                // Federation left while this watcher was running. Nothing
+                // left to report to, so end the task instead of panicking it.
+                let Some(client) = self_copy
+                    .clients
+                    .read()
+                    .await
+                    .get(&federation_id)
+                    .map(|joined| joined.client.clone())
+                else {
+                    return;
                 };
+                client
+                    .operation_log()
+                    .get_operation(operation_id)
+                    .await
+                    .map(|entry| entry.operation_module_kind() == "ln")
+                    .unwrap_or(false)
+            };
 
-                match self_copy.await_receive(&federation_id, operation_id).await {
-                    Ok((final_state, amount_msats)) => {
-                        info_to_flutter(format!("Receive completed: {final_state:?}")).await;
-                        if final_state == FinalReceiveOperationState::Claimed && is_lnv1 {
-                            let lightning_event =
-                                LightningEventKind::InvoicePaid(InvoicePaidEvent { amount_msats });
-                            let multimint_event =
-                                MultimintEvent::Lightning((federation_id, lightning_event));
-                            get_event_bus().publish(multimint_event).await;
-                        }
-                    }
-                    Err(e) => {
-                        info_to_flutter(format!("Could not await receive {operation_id:?} {e:?}"))
-                            .await;
+            match self_copy.await_receive(&federation_id, operation_id).await {
+                Ok((final_state, amount_msats)) => {
+                    info_to_flutter(format!("Receive completed: {final_state:?}")).await;
+                    if final_state == FinalReceiveOperationState::Claimed && is_lnv1 {
+                        let lightning_event =
+                            LightningEventKind::InvoicePaid(InvoicePaidEvent { amount_msats });
+                        let multimint_event =
+                            MultimintEvent::Lightning((federation_id, lightning_event));
+                        get_event_bus().publish(multimint_event).await;
                     }
                 }
-            });
+                Err(e) => {
+                    info_to_flutter(format!("Could not await receive {operation_id:?} {e:?}"))
+                        .await;
+                }
+            }
+        });
     }
 
     async fn receive_lnv2(
@@ -2642,6 +3065,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or(anyhow!("No federation exists"))?
+            .client
             .clone();
         let requested = amount.msats;
 
@@ -2850,6 +3274,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or(anyhow!("No federation exists"))?
+            .client
             .clone();
 
         // The federation fee is quoted per gateway (the contract amount, and thus
@@ -2908,13 +3333,7 @@ impl Multimint {
         gateway_fee_msats: u64,
         ln_address: Option<String>,
     ) -> EcashAppResult<OperationId> {
-        let client = self
-            .clients
-            .read()
-            .await
-            .get(federation_id)
-            .ok_or_else(|| EcashAppError::other("federation does not exist"))?
-            .clone();
+        let JoinedFederation { client, tasks } = self.get_federation(federation_id).await?;
         let invoice = Bolt11Invoice::from_str(&invoice)
             .map_err(|e| EcashAppError::InvalidInvoice(e.to_string()))?;
         if invoice.is_expired() {
@@ -2939,7 +3358,7 @@ impl Multimint {
             .await
             {
                 info_to_flutter("Successfully initated LNv2 payment").await;
-                self.spawn_await_send(*federation_id, lnv2_operation_id);
+                self.spawn_await_send(&tasks, *federation_id, lnv2_operation_id);
                 return Ok(lnv2_operation_id);
             }
         }
@@ -2947,7 +3366,7 @@ impl Multimint {
         info_to_flutter("Attempting to pay using LNv1...").await;
         let operation_id = Self::pay_lnv1(&client, invoice, gateway, custom_meta).await?;
         info_to_flutter("Successfully initiated LNv1 payment").await;
-        self.spawn_await_send(*federation_id, operation_id);
+        self.spawn_await_send(&tasks, *federation_id, operation_id);
         Ok(operation_id)
     }
 
@@ -2990,9 +3409,14 @@ impl Multimint {
         Ok(outgoing_lightning_payment.payment_type.operation_id())
     }
 
-    fn spawn_await_send(&self, federation_id: FederationId, operation_id: OperationId) {
+    fn spawn_await_send(
+        &self,
+        tasks: &TaskGroup,
+        federation_id: FederationId,
+        operation_id: OperationId,
+    ) {
         let self_copy = self.clone();
-        self.task_group.spawn_cancellable("await send", async move {
+        tasks.spawn_cancellable("await send", async move {
             let final_state = self_copy.await_send(&federation_id, operation_id).await;
             match final_state {
                 // The preimage is deliberately not bound: it is the
@@ -3014,23 +3438,26 @@ impl Multimint {
     /// Drives an on-chain send (peg-out) operation to completion. Used on
     /// startup to finish a withdraw that was in flight when the app last closed;
     /// works for both walletv1 and walletv2 (see [`Self::await_withdraw`]).
-    fn spawn_await_withdraw(&self, federation_id: FederationId, operation_id: OperationId) {
+    fn spawn_await_withdraw(
+        &self,
+        tasks: &TaskGroup,
+        federation_id: FederationId,
+        operation_id: OperationId,
+    ) {
         let self_copy = self.clone();
-        self.task_group
-            .spawn_cancellable("await withdraw", async move {
-                match self_copy.await_withdraw(&federation_id, operation_id).await {
-                    Ok(txid) => {
-                        info_to_flutter(format!("On-chain send completed: {txid}")).await;
-                    }
-                    Err(e) => {
-                        // await_withdraw already surfaces genuine failures via a
-                        // toast; this only records the outcome (or a no-op error from
-                        // driving an operation that isn't a send).
-                        info_to_flutter(format!("await_withdraw({operation_id:?}) ended: {e}"))
-                            .await;
-                    }
+        tasks.spawn_cancellable("await withdraw", async move {
+            match self_copy.await_withdraw(&federation_id, operation_id).await {
+                Ok(txid) => {
+                    info_to_flutter(format!("On-chain send completed: {txid}")).await;
                 }
-            });
+                Err(e) => {
+                    // await_withdraw already surfaces genuine failures via a
+                    // toast; this only records the outcome (or a no-op error from
+                    // driving an operation that isn't a send).
+                    info_to_flutter(format!("await_withdraw({operation_id:?}) ended: {e}")).await;
+                }
+            }
+        });
     }
 
     pub async fn await_send(
@@ -3041,7 +3468,13 @@ impl Multimint {
         // Left mid-payment: report a failure to whoever is awaiting rather than
         // panicking their task. The payment's real outcome is settled by the
         // federation regardless of whether this client is still around to watch.
-        let Some(client) = self.clients.read().await.get(federation_id).cloned() else {
+        let Some(client) = self
+            .clients
+            .read()
+            .await
+            .get(federation_id)
+            .map(|joined| joined.client.clone())
+        else {
             return LightningSendOutcome::Failure(EcashAppError::other(
                 "Federation was left while the payment was in flight",
             ));
@@ -3179,7 +3612,7 @@ impl Multimint {
             .read()
             .await
             .get(federation_id)
-            .cloned()
+            .map(|joined| joined.client.clone())
             .ok_or(anyhow!("No federation exists"))?;
         let (receive_state, amount) = match Self::await_receive_lnv2(&client, operation_id).await {
             Ok(lnv2_final_state) => lnv2_final_state,
@@ -3259,60 +3692,59 @@ impl Multimint {
 
     async fn spawn_await_recurringd_receive(
         &self,
+        tasks: &TaskGroup,
         client: ClientHandleArc,
         operation_id: OperationId,
         federation_id: FederationId,
     ) {
-        self.task_group
-            .spawn_cancellable("recurringd invoice", async move {
-                info_to_flutter(format!(
-                    "Checking invoice with operation id: {operation_id:?}"
-                ))
-                .await;
-                if let Ok(lnv1) = client.get_first_module::<LightningClientModule>() {
-                    if let Ok(updates) = lnv1.subscribe_ln_recurring_receive(operation_id).await {
-                        let mut stream = updates.into_stream();
-                        let mut final_state = FinalReceiveOperationState::Failure;
-                        let operation = client
-                            .operation_log()
-                            .get_operation(operation_id)
-                            .await
-                            .expect("operation must exist");
-                        while let Some(update) = stream.next().await {
-                            if update == LnReceiveState::Claimed {
-                                final_state = FinalReceiveOperationState::Claimed;
-                                if let LightningOperationMetaVariant::RecurringPaymentReceive(
-                                    meta,
-                                ) = operation
+        tasks.spawn_cancellable("recurringd invoice", async move {
+            info_to_flutter(format!(
+                "Checking invoice with operation id: {operation_id:?}"
+            ))
+            .await;
+            if let Ok(lnv1) = client.get_first_module::<LightningClientModule>() {
+                if let Ok(updates) = lnv1.subscribe_ln_recurring_receive(operation_id).await {
+                    let mut stream = updates.into_stream();
+                    let mut final_state = FinalReceiveOperationState::Failure;
+                    let operation = client
+                        .operation_log()
+                        .get_operation(operation_id)
+                        .await
+                        .expect("operation must exist");
+                    while let Some(update) = stream.next().await {
+                        if update == LnReceiveState::Claimed {
+                            final_state = FinalReceiveOperationState::Claimed;
+                            if let LightningOperationMetaVariant::RecurringPaymentReceive(meta) =
+                                operation
                                     .meta::<fedimint_ln_client::LightningOperationMeta>()
                                     .variant
-                                {
-                                    // The payment landed either way; report zero
-                                    // rather than panicking this spawned task if
-                                    // the invoice carried no amount.
-                                    let amount_msats =
-                                        meta.invoice.amount_milli_satoshis().unwrap_or(0);
-                                    let lightning_event =
-                                        LightningEventKind::InvoicePaid(InvoicePaidEvent {
-                                            amount_msats,
-                                        });
-                                    info_to_flutter(format!(
-                                        "Recurringd receive completed: {final_state:?}"
-                                    ))
-                                    .await;
-                                    let multimint_event =
-                                        MultimintEvent::Lightning((federation_id, lightning_event));
-                                    get_event_bus().publish(multimint_event).await;
-                                }
+                            {
+                                // The payment landed either way; report zero
+                                // rather than panicking this spawned task if
+                                // the invoice carried no amount.
+                                let amount_msats =
+                                    meta.invoice.amount_milli_satoshis().unwrap_or(0);
+                                let lightning_event =
+                                    LightningEventKind::InvoicePaid(InvoicePaidEvent {
+                                        amount_msats,
+                                    });
+                                info_to_flutter(format!(
+                                    "Recurringd receive completed: {final_state:?}"
+                                ))
+                                .await;
+                                let multimint_event =
+                                    MultimintEvent::Lightning((federation_id, lightning_event));
+                                get_event_bus().publish(multimint_event).await;
                             }
                         }
-                        info_to_flutter(format!(
-                            "Final state of recurringd receive: {final_state:?}"
-                        ))
-                        .await;
                     }
+                    info_to_flutter(format!(
+                        "Final state of recurringd receive: {final_state:?}"
+                    ))
+                    .await;
                 }
-            });
+            }
+        });
 
         let mut recurringd_invoices = self.recurringd_invoices.write().await;
         recurringd_invoices.insert(operation_id);
@@ -3342,27 +3774,26 @@ impl Multimint {
         }
     }
 
-    async fn lnv1_update_gateway_cache(&self, client: &ClientHandleArc) {
+    fn lnv1_update_gateway_cache(&self, tasks: &TaskGroup, client: &ClientHandleArc) {
         let lnv1_client = client.clone();
-        self.task_group
-            .spawn_cancellable("update gateway cache", async move {
-                // LNv2-only federations have no LNv1 (`ln`) module, so there is
-                // no LNv1 gateway cache to maintain — skip instead of panicking.
-                let Ok(lnv1) = lnv1_client.get_first_module::<LightningClientModule>() else {
-                    info_to_flutter(
-                        "Skipping LNv1 gateway cache update; federation has no LNv1 module",
-                    )
-                    .await;
-                    return;
-                };
-                match lnv1.update_gateway_cache().await {
-                    Ok(_) => info_to_flutter("Updated gateway cache").await,
-                    Err(e) => info_to_flutter(format!("Could not update gateway cache {e}")).await,
-                }
+        tasks.spawn_cancellable("update gateway cache", async move {
+            // LNv2-only federations have no LNv1 (`ln`) module, so there is
+            // no LNv1 gateway cache to maintain — skip instead of panicking.
+            let Ok(lnv1) = lnv1_client.get_first_module::<LightningClientModule>() else {
+                info_to_flutter(
+                    "Skipping LNv1 gateway cache update; federation has no LNv1 module",
+                )
+                .await;
+                return;
+            };
+            match lnv1.update_gateway_cache().await {
+                Ok(_) => info_to_flutter("Updated gateway cache").await,
+                Err(e) => info_to_flutter(format!("Could not update gateway cache {e}")).await,
+            }
 
-                lnv1.update_gateway_cache_continuously(|gateway| async { gateway })
-                    .await
-            });
+            lnv1.update_gateway_cache_continuously(|gateway| async { gateway })
+                .await
+        });
     }
 
     /// Report an operation the history renderer cannot read and move on.
@@ -3388,7 +3819,13 @@ impl Multimint {
     ) -> Vec<Transaction> {
         // A federation that is gone has no history to render. Callers poll this
         // from screens that can outlive the client by a frame or two.
-        let Some(client) = self.clients.read().await.get(federation_id).cloned() else {
+        let Some(client) = self
+            .clients
+            .read()
+            .await
+            .get(federation_id)
+            .map(|joined| joined.client.clone())
+        else {
             return Vec::new();
         };
 
@@ -4145,6 +4582,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or_else(|| EcashAppError::other("federation does not exist"))?
+            .client
             .clone();
         // The send fee (the federation reissue fee, quoted on the review screen)
         // isn't recoverable from the operation log afterwards — the reissue that
@@ -4176,43 +4614,47 @@ impl Multimint {
         Ok(OOBNotesWrapper(WrappedEcash::V1(notes)))
     }
 
-    fn spawn_await_ecash_send(&self, federation_id: FederationId, operation_id: OperationId) {
+    fn spawn_await_ecash_send(
+        &self,
+        tasks: &TaskGroup,
+        federation_id: FederationId,
+        operation_id: OperationId,
+    ) {
         let self_copy = self.clone();
-        self.task_group
-            .spawn_cancellable("await ecash send", async move {
-                match self_copy
-                    .await_ecash_send(&federation_id, operation_id)
-                    .await
-                {
-                    Ok(final_state) => {
-                        info_to_flutter(format!("Ecash send completed: {final_state:?}")).await;
-                        match final_state {
-                            // Recipient reissued — spend is successful.
-                            SpendOOBState::Success => {}
-                            // User canceled and got the money back — also fine.
-                            SpendOOBState::UserCanceledSuccess => {}
-                            // Transient / never the final state in practice.
-                            SpendOOBState::Created | SpendOOBState::UserCanceledProcessing => {}
-                            // User tried to cancel but the notes were already spent by the
-                            // recipient — the spend still succeeded, so this isn't an error.
-                            SpendOOBState::UserCanceledFailure => {}
-                            // Auto-cancel succeeded — recipient never reissued.
-                            SpendOOBState::Refunded => {
-                                payment_error_to_flutter(
-                                    federation_id,
-                                    EcashAppError::PaymentRefunded(
-                                        "recipient did not redeem ecash".to_string(),
-                                    ),
-                                )
-                                .await;
-                            }
+        tasks.spawn_cancellable("await ecash send", async move {
+            match self_copy
+                .await_ecash_send(&federation_id, operation_id)
+                .await
+            {
+                Ok(final_state) => {
+                    info_to_flutter(format!("Ecash send completed: {final_state:?}")).await;
+                    match final_state {
+                        // Recipient reissued — spend is successful.
+                        SpendOOBState::Success => {}
+                        // User canceled and got the money back — also fine.
+                        SpendOOBState::UserCanceledSuccess => {}
+                        // Transient / never the final state in practice.
+                        SpendOOBState::Created | SpendOOBState::UserCanceledProcessing => {}
+                        // User tried to cancel but the notes were already spent by the
+                        // recipient — the spend still succeeded, so this isn't an error.
+                        SpendOOBState::UserCanceledFailure => {}
+                        // Auto-cancel succeeded — recipient never reissued.
+                        SpendOOBState::Refunded => {
+                            payment_error_to_flutter(
+                                federation_id,
+                                EcashAppError::PaymentRefunded(
+                                    "recipient did not redeem ecash".to_string(),
+                                ),
+                            )
+                            .await;
                         }
                     }
-                    Err(e) => {
-                        payment_error_to_flutter(federation_id, e).await;
-                    }
                 }
-            });
+                Err(e) => {
+                    payment_error_to_flutter(federation_id, e).await;
+                }
+            }
+        });
     }
 
     pub async fn await_ecash_send(
@@ -4226,6 +4668,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or_else(|| EcashAppError::other("federation does not exist"))?
+            .client
             .clone();
         let mint = client
             .get_first_module::<MintClientModule>()
@@ -4281,6 +4724,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or(anyhow!("No federation exists"))?
+            .client
             .clone();
 
         let requested = Amount::from_msats(amount_msats);
@@ -4324,6 +4768,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or(anyhow!("No federation exists"))?
+            .client
             .clone();
 
         // Both mint modules quote the exact fee by dry-running their real change
@@ -4360,6 +4805,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or(anyhow!("No federation exists"))?
+            .client
             .clone();
 
         // mintv2 exposes no note-level spent query; its idempotent `receive`
@@ -4391,13 +4837,7 @@ impl Multimint {
         ecash: String,
         fees: ReissueFees,
     ) -> EcashAppResult<OperationId> {
-        let client = self
-            .clients
-            .read()
-            .await
-            .get(federation_id)
-            .ok_or_else(|| EcashAppError::other("federation does not exist"))?
-            .clone();
+        let JoinedFederation { client, tasks } = self.get_federation(federation_id).await?;
 
         // mintv2 uses a different ecash encoding (base32 `ECash`) and a simpler,
         // idempotent `receive` that reissues the notes in the background.
@@ -4417,7 +4857,7 @@ impl Multimint {
                 .receive(ecash_obj, custom_meta)
                 .await
                 .map_err(EcashAppError::from_display)?;
-            self.spawn_await_mintv2_receive(*federation_id, operation_id, amount_msats);
+            self.spawn_await_mintv2_receive(&tasks, *federation_id, operation_id, amount_msats);
             return Ok(operation_id);
         }
 
@@ -4443,48 +4883,51 @@ impl Multimint {
             .reissue_external_notes(notes, extra_meta)
             .await
             .map_err(EcashAppError::from_display)?;
-        self.spawn_await_ecash_reissue(*federation_id, operation_id);
+        self.spawn_await_ecash_reissue(&tasks, *federation_id, operation_id);
         Ok(operation_id)
     }
 
-    fn spawn_await_ecash_reissue(&self, federation_id: FederationId, operation_id: OperationId) {
+    fn spawn_await_ecash_reissue(
+        &self,
+        tasks: &TaskGroup,
+        federation_id: FederationId,
+        operation_id: OperationId,
+    ) {
         let self_copy = self.clone();
-        self.task_group
-            .spawn_cancellable("await ecash reissue", async move {
-                match self_copy
-                    .await_ecash_reissue(&federation_id, operation_id)
-                    .await
-                {
-                    Ok((final_state, amount)) => {
-                        info_to_flutter(format!("Ecash reissue completed: {final_state:?}")).await;
-                        match final_state {
-                            ReissueExternalNotesState::Done => {
-                                if let Some(amount) = amount {
-                                    let ecash_event =
-                                        MultimintEvent::Ecash((federation_id, amount));
-                                    get_event_bus().publish(ecash_event).await;
-                                }
+        tasks.spawn_cancellable("await ecash reissue", async move {
+            match self_copy
+                .await_ecash_reissue(&federation_id, operation_id)
+                .await
+            {
+                Ok((final_state, amount)) => {
+                    info_to_flutter(format!("Ecash reissue completed: {final_state:?}")).await;
+                    match final_state {
+                        ReissueExternalNotesState::Done => {
+                            if let Some(amount) = amount {
+                                let ecash_event = MultimintEvent::Ecash((federation_id, amount));
+                                get_event_bus().publish(ecash_event).await;
                             }
-                            ReissueExternalNotesState::Failed(msg) => {
-                                // A reissue failure is most commonly caused by notes that have
-                                // already been spent (e.g. reissuing the same ecash twice),
-                                // which is the actionable case for the user. Keep the raw
-                                // reason in the log for diagnostics.
-                                info_to_flutter(format!("Ecash reissue failed: {msg}")).await;
-                                payment_error_to_flutter(
-                                    federation_id,
-                                    EcashAppError::EcashAlreadySpent,
-                                )
-                                .await;
-                            }
-                            _ => {}
                         }
-                    }
-                    Err(e) => {
-                        payment_error_to_flutter(federation_id, EcashAppError::from(e)).await;
+                        ReissueExternalNotesState::Failed(msg) => {
+                            // A reissue failure is most commonly caused by notes that have
+                            // already been spent (e.g. reissuing the same ecash twice),
+                            // which is the actionable case for the user. Keep the raw
+                            // reason in the log for diagnostics.
+                            info_to_flutter(format!("Ecash reissue failed: {msg}")).await;
+                            payment_error_to_flutter(
+                                federation_id,
+                                EcashAppError::EcashAlreadySpent,
+                            )
+                            .await;
+                        }
+                        _ => {}
                     }
                 }
-            });
+                Err(e) => {
+                    payment_error_to_flutter(federation_id, EcashAppError::from(e)).await;
+                }
+            }
+        });
     }
 
     pub async fn await_ecash_reissue(
@@ -4498,6 +4941,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or(anyhow!("No federation exists"))?
+            .client
             .clone();
 
         // mintv2 has a simpler Success/Rejected outcome; map it onto the v1
@@ -4584,73 +5028,71 @@ impl Multimint {
     /// the mintv2 receive meta does not carry the amount directly.
     fn spawn_await_mintv2_receive(
         &self,
+        tasks: &TaskGroup,
         federation_id: FederationId,
         operation_id: OperationId,
         amount_msats: u64,
     ) {
         let self_copy = self.clone();
-        self.task_group
-            .spawn_cancellable("await mintv2 receive", async move {
-                let client = match self_copy.get_client(&federation_id).await {
-                    Ok(client) => client,
-                    Err(e) => {
-                        info_to_flutter(format!("await mintv2 receive: {e}")).await;
-                        return;
-                    }
-                };
-                let Ok(mintv2) = client.get_first_module::<MintV2Module>() else {
+        tasks.spawn_cancellable("await mintv2 receive", async move {
+            let client = match self_copy.get_client(&federation_id).await {
+                Ok(client) => client,
+                Err(e) => {
+                    info_to_flutter(format!("await mintv2 receive: {e}")).await;
                     return;
-                };
-                match mintv2
-                    .await_final_receive_operation_state(operation_id)
-                    .await
-                {
-                    Ok(MintV2FinalReceiveOperationState::Success) => {
-                        // Reaching `Success` only means the reissue tx was accepted
-                        // into consensus; the reissued notes are finalized
-                        // asynchronously by the mintv2 output state machines
-                        // (blind-signature fetch + note write). Wait for those
-                        // outputs before publishing so the balance reflects the
-                        // reissue — otherwise the dashboard refreshes before the
-                        // notes land and shows a stale value until the next manual
-                        // refresh. This mirrors the walletv2 deposit path.
-                        if let Some(op) = client.operation_log().get_operation(operation_id).await {
-                            if let MintV2OperationMeta::Receive {
-                                change_outpoint_range,
-                                ..
-                            } = op.meta::<MintV2OperationMeta>()
+                }
+            };
+            let Ok(mintv2) = client.get_first_module::<MintV2Module>() else {
+                return;
+            };
+            match mintv2
+                .await_final_receive_operation_state(operation_id)
+                .await
+            {
+                Ok(MintV2FinalReceiveOperationState::Success) => {
+                    // Reaching `Success` only means the reissue tx was accepted
+                    // into consensus; the reissued notes are finalized
+                    // asynchronously by the mintv2 output state machines
+                    // (blind-signature fetch + note write). Wait for those
+                    // outputs before publishing so the balance reflects the
+                    // reissue — otherwise the dashboard refreshes before the
+                    // notes land and shows a stale value until the next manual
+                    // refresh. This mirrors the walletv2 deposit path.
+                    if let Some(op) = client.operation_log().get_operation(operation_id).await {
+                        if let MintV2OperationMeta::Receive {
+                            change_outpoint_range,
+                            ..
+                        } = op.meta::<MintV2OperationMeta>()
+                        {
+                            if let Err(e) = client
+                                .await_primary_bitcoin_module_outputs(
+                                    operation_id,
+                                    change_outpoint_range.into_iter().collect(),
+                                )
+                                .await
                             {
-                                if let Err(e) = client
-                                    .await_primary_bitcoin_module_outputs(
-                                        operation_id,
-                                        change_outpoint_range.into_iter().collect(),
-                                    )
-                                    .await
-                                {
-                                    info_to_flutter(format!(
-                                        "mintv2 await primary module outputs error: {e:?}"
-                                    ))
-                                    .await;
-                                }
+                                info_to_flutter(format!(
+                                    "mintv2 await primary module outputs error: {e:?}"
+                                ))
+                                .await;
                             }
                         }
+                    }
 
-                        get_event_bus()
-                            .publish(MultimintEvent::Ecash((federation_id, amount_msats)))
-                            .await;
-                        info_to_flutter(format!("mintv2 receive completed: {amount_msats} msats"))
-                            .await;
-                    }
-                    Ok(MintV2FinalReceiveOperationState::Rejected) => {
-                        payment_error_to_flutter(federation_id, EcashAppError::EcashAlreadySpent)
-                            .await;
-                    }
-                    Err(e) => {
-                        payment_error_to_flutter(federation_id, EcashAppError::from_display(e))
-                            .await;
-                    }
+                    get_event_bus()
+                        .publish(MultimintEvent::Ecash((federation_id, amount_msats)))
+                        .await;
+                    info_to_flutter(format!("mintv2 receive completed: {amount_msats} msats"))
+                        .await;
                 }
-            });
+                Ok(MintV2FinalReceiveOperationState::Rejected) => {
+                    payment_error_to_flutter(federation_id, EcashAppError::EcashAlreadySpent).await;
+                }
+                Err(e) => {
+                    payment_error_to_flutter(federation_id, EcashAppError::from_display(e)).await;
+                }
+            }
+        });
     }
 
     pub async fn calculate_withdraw_fees(
@@ -4706,6 +5148,18 @@ impl Multimint {
         &self,
         federation_id: &FederationId,
     ) -> EcashAppResult<ClientHandleArc> {
+        Ok(self.get_federation(federation_id).await?.client)
+    }
+
+    /// The client *and* its task group.
+    ///
+    /// Used by the paths that look a federation up in order to start work on
+    /// it: whatever background watcher that work needs afterwards belongs on
+    /// the group returned here, so that leaving the federation cancels it.
+    pub(crate) async fn get_federation(
+        &self,
+        federation_id: &FederationId,
+    ) -> EcashAppResult<JoinedFederation> {
         self.clients
             .read()
             .await
@@ -4724,6 +5178,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or(anyhow!("No federation exists for peg-in fee query"))?
+            .client
             .clone();
 
         // walletv2 charges a fixed base fee plus a relative (ppm) fee, both read
@@ -4788,6 +5243,7 @@ impl Multimint {
                 clients
                     .get(&federation_id)
                     .ok_or(anyhow!("No federation exists"))?
+                    .client
                     .clone()
             }
         };
@@ -4823,7 +5279,7 @@ impl Multimint {
         &self,
         federation_id: FederationId,
     ) -> anyhow::Result<(String, Option<u64>)> {
-        let client = self
+        let JoinedFederation { client, tasks } = self
             .clients
             .read()
             .await
@@ -4831,7 +5287,7 @@ impl Multimint {
             .cloned()
             .ok_or(anyhow!("No federation exists"))?;
         self.wallet_handler
-            .allocate_deposit_address(federation_id, client)
+            .allocate_deposit_address(&tasks, federation_id, client)
             .await
     }
 
@@ -4841,7 +5297,9 @@ impl Multimint {
     ) -> Vec<(String, Option<u64>, Option<u64>)> {
         let client = {
             let clients = self.clients.read().await;
-            clients.get(federation_id).cloned()
+            clients
+                .get(federation_id)
+                .map(|joined| joined.client.clone())
         };
         let Some(client) = client else {
             return Vec::new();
@@ -4884,6 +5342,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .context("No federation exists")?
+            .client
             .clone();
         let wallet_module =
             client.get_first_module::<fedimint_wallet_client::WalletClientModule>()?;
@@ -4904,6 +5363,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .context("No federation exists")?
+            .client
             .clone();
 
         if let Ok(mintv2) = client.get_first_module::<MintV2Module>() {
@@ -4944,6 +5404,7 @@ impl Multimint {
                 clients
                     .get(&federation_id)
                     .ok_or(anyhow!("No federation exists"))?
+                    .client
                     .clone()
             }
         };
@@ -5113,6 +5574,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .context("No federation exists")?
+            .client
             .clone();
         let lnv2_gateways = self.lnv2_gateways(federation_id).await;
 
@@ -5265,6 +5727,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .context("No federation exists")?
+            .client
             .clone();
 
         let safe_ln_address_api = SafeUrl::parse(ln_address_api)?;
@@ -5548,6 +6011,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or(anyhow!("No federation exists"))?
+            .client
             .clone();
         let lnv2 = client.get_first_module::<fedimint_lnv2_client::LightningClientModule>()?;
         let lnv2_gateways = lnv2.list_gateways(None).await?;
@@ -5666,7 +6130,10 @@ impl Multimint {
                         .await;
                     for (key, config) in lightning_configs {
                         let federation_id = key.federation_id;
-                        if let Some(client) = self_copy.clients.read().await.get(&federation_id) {
+                        if let Some(joined) =
+                            self_copy.clients.read().await.get(&federation_id).cloned()
+                        {
+                            let JoinedFederation { client, tasks } = joined;
                             // This poller only drives the LNv1 recurringd flow.
                             // LNv2-only federations have no `ln` module (their
                             // LNURL receives are detected via the LNv2 contract
@@ -5698,6 +6165,7 @@ impl Multimint {
                                         {
                                             self_copy
                                                 .spawn_await_recurringd_receive(
+                                                    &tasks,
                                                     client.clone(),
                                                     operation_id,
                                                     federation_id,
@@ -5733,7 +6201,12 @@ impl Multimint {
 
                 for (key, config) in lightning_configs {
                     let federation_id = key.federation_id;
-                    let Some(client) = self_copy.clients.read().await.get(&federation_id).cloned()
+                    let Some(client) = self_copy
+                        .clients
+                        .read()
+                        .await
+                        .get(&federation_id)
+                        .map(|joined| joined.client.clone())
                     else {
                         continue;
                     };
@@ -5809,7 +6282,7 @@ impl Multimint {
         // `invite_code().await` and block joins.
         let clients: BTreeMap<FederationId, ClientHandleArc> = {
             let guard = self.clients.read().await;
-            guard.iter().map(|(k, v)| (*k, v.clone())).collect()
+            guard.iter().map(|(k, v)| (*k, v.client.clone())).collect()
         };
         let mut all_invite_codes = Vec::new();
         for (key, config) in configs {
@@ -5932,6 +6405,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or(anyhow!("Federation does not exist"))?
+            .client
             .clone();
         Ok(client
             .invite_code(peer.into())
@@ -5954,6 +6428,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or(anyhow!("Federation does not exist"))?
+            .client
             .clone();
         let invite = client
             .invite_code(peer.into())
@@ -6040,6 +6515,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or(anyhow!("Federation does not exist"))?
+            .client
             .clone();
         let api = self.guardian_admin_api(federation_id, peer).await?;
 
@@ -6148,6 +6624,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or(anyhow!("Federation does not exist"))?
+            .client
             .clone();
         let lnv2 = client.get_first_module::<fedimint_lnv2_client::LightningClientModule>()?;
         let gateways = lnv2
@@ -6168,6 +6645,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or(anyhow!("Federation does not exist"))?
+            .client
             .clone();
         let lnv2_id = client
             .get_first_module::<fedimint_lnv2_client::LightningClientModule>()?
@@ -6206,6 +6684,7 @@ impl Multimint {
             .await
             .get(federation_id)
             .ok_or(anyhow!("Federation does not exist"))?
+            .client
             .clone();
         let meta_id = client.get_first_module::<MetaClientModule>()?.id;
         let total_guardians = client.config().await.global.api_endpoints.len() as u16;

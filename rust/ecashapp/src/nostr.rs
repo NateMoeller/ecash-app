@@ -253,6 +253,12 @@ pub(crate) struct NostrClient {
     db: Database,
     keys: nostr_sdk::Keys,
     nwc_listeners: Arc<RwLock<BTreeMap<FederationId, oneshot::Sender<()>>>>,
+    /// Whether NWC listens in this process at all.
+    ///
+    /// On desktop it does. On Android the listener runs in the foreground
+    /// service's own isolate instead, so spawning one here too would answer
+    /// every request twice.
+    is_desktop: bool,
 }
 
 impl NostrClient {
@@ -275,13 +281,14 @@ impl NostrClient {
 
         let client = nostr_sdk::Client::builder().signer(keys.clone()).build();
 
-        let mut nostr_client = NostrClient {
+        let nostr_client = NostrClient {
             nostr_client: client,
             public_federations: Arc::new(RwLock::new(vec![])),
             task_group: TaskGroup::new(),
             db: db.clone(),
             keys,
             nwc_listeners: Arc::new(RwLock::new(BTreeMap::new())),
+            is_desktop,
         };
 
         let mut background_nostr = nostr_client.clone();
@@ -498,7 +505,7 @@ impl NostrClient {
     }
 
     async fn spawn_listen_for_nwc(
-        &mut self,
+        &self,
         federation_id: &FederationId,
         nwc_config: NostrWalletConnectV2Config,
     ) {
@@ -1135,10 +1142,60 @@ impl NostrClient {
             .await;
         dbtx.commit_tx().await;
 
+        self.stop_nwc_listener(&federation_id).await;
+    }
+
+    /// Stops the in-process NWC listener for a federation, leaving its stored
+    /// pairing alone.
+    ///
+    /// This is what leaving a federation needs. The pairing row is deliberately
+    /// kept so that re-joining picks it back up with the credentials the user
+    /// already handed out, but the listener itself has to go: it holds a live
+    /// relay subscription and would keep fielding `pay_invoice` requests for a
+    /// wallet that is no longer there.
+    ///
+    /// Only covers the desktop listener. On Android the listener runs in the
+    /// foreground-service isolate, with its own Rust instance and its own copy
+    /// of this map, so Dart stops that one when the federation is left.
+    pub(crate) async fn stop_nwc_listener(&self, federation_id: &FederationId) {
         let mut listeners = self.nwc_listeners.write().await;
-        if let Some(sender) = listeners.remove(&federation_id) {
+        if let Some(sender) = listeners.remove(federation_id) {
+            info_to_flutter(format!("Stopping NWC listener for {federation_id}")).await;
             let _ = sender.send(());
         }
+    }
+
+    /// Restarts the NWC listener for a federation that has just been joined,
+    /// if it still has a pairing from before.
+    ///
+    /// The counterpart to [`Self::stop_nwc_listener`]. Leaving a federation
+    /// stops its listener but deliberately keeps the pairing row, so joining
+    /// again has to put the listener back — otherwise the NWC screen would show
+    /// a live pairing that nothing is actually answering until the next app
+    /// launch, which is the one place that used to spawn these.
+    ///
+    /// A no-op on Android, where the listener belongs to the foreground service
+    /// isolate rather than to this process.
+    pub(crate) async fn restart_nwc_listener(&self, federation_id: &FederationId) {
+        if !self.is_desktop {
+            return;
+        }
+
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        let Some(nwc_config) = dbtx
+            .get_value(&NostrWalletConnectV2Key {
+                federation_id: *federation_id,
+            })
+            .await
+        else {
+            return;
+        };
+
+        info_to_flutter(format!(
+            "Restarting NWC listener for re-joined federation {federation_id}"
+        ))
+        .await;
+        self.spawn_listen_for_nwc(federation_id, nwc_config).await;
     }
 
     /// Get NWC config for a federation and return it.

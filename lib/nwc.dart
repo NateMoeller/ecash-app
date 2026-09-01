@@ -52,6 +52,131 @@ void startNWCCallback() {
   FlutterForegroundTask.setTaskHandler(NWCTaskHandler());
 }
 
+/// Starts the Android NWC foreground service for [federation].
+///
+/// Shared by the NWC screen and by the join path, so that a service started
+/// either way carries the same notification, channel and payload.
+Future<void> _launchNwcForegroundService(
+  BuildContext context,
+  FederationSelector federation,
+) async {
+  // Which federation the service is serving. Read back by the task handler to
+  // pick its wallet, and by `stopNwcServiceForFederation` to decide whether a
+  // running service belongs to the federation being left.
+  final federationIdStr = await federationIdToString(
+    federationId: federation.federationId,
+  );
+  await FlutterForegroundTask.saveData(
+    key: 'federation_id',
+    value: federationIdStr,
+  );
+
+  if (!context.mounted) return;
+
+  FlutterForegroundTask.init(
+    androidNotificationOptions: AndroidNotificationOptions(
+      channelId: 'nwc_foreground_service',
+      channelName: context.l10n.nwcForegroundService,
+      channelDescription: context.l10n.nwcForegroundServiceDescription,
+      onlyAlertOnce: true,
+    ),
+    iosNotificationOptions: const IOSNotificationOptions(
+      showNotification: false,
+    ),
+    foregroundTaskOptions: ForegroundTaskOptions(
+      eventAction: ForegroundTaskEventAction.nothing(),
+    ),
+  );
+
+  await FlutterForegroundTask.startService(
+    serviceId: 256,
+    notificationTitle: context.l10n.nwcActive,
+    notificationText: context.l10n.nwcConnectedTo(federation.federationName),
+    notificationIcon: const NotificationIcon(
+      metaDataName: 'com.ecashapp.NOTIFICATION_ICON',
+    ),
+    callback: startNWCCallback,
+  );
+}
+
+/// Restarts the Android NWC foreground service for a federation that was just
+/// joined, if it still has a pairing from before it was left.
+///
+/// The Android counterpart to the Rust `restart_nwc_listener`. Leaving stops
+/// the service but keeps the pairing, so re-joining has to put the service
+/// back; otherwise NWC stays silently dead until the user happens to open the
+/// NWC settings screen, which is the only other place that starts it.
+///
+/// Never prompts. A user who paired NWC before has already granted the
+/// notification permission, and asking for it in the middle of joining a
+/// federation would come out of nowhere — so if it is not already granted this
+/// does nothing and leaves the NWC screen to ask properly.
+Future<void> startNwcServiceIfPaired(
+  BuildContext context,
+  FederationSelector federation,
+) async {
+  if (!Platform.isAndroid) return;
+
+  try {
+    if (await FlutterForegroundTask.isRunningService) return;
+    if (!await Permission.notification.status.isGranted) return;
+
+    // Only lists pairings whose federation is currently joined, so this is
+    // empty unless the federation just joined really does have one.
+    final configs = await getNwcConnectionInfo();
+    final paired = configs.any(
+      (config) => config.$1.federationName == federation.federationName,
+    );
+    if (!paired) return;
+
+    AppLogger.instance.info(
+      '[NWC] Restarting foreground service for re-joined federation',
+    );
+    if (!context.mounted) return;
+    await _launchNwcForegroundService(context, federation);
+  } catch (e) {
+    // Never block joining a federation on this; the NWC screen can still start
+    // the service by hand.
+    AppLogger.instance.error('[NWC] Could not restart foreground service: $e');
+  }
+}
+
+/// Stops the Android NWC foreground service if it is currently serving
+/// [federationId].
+///
+/// The service runs in its own isolate with its own Rust instance, so the
+/// listener teardown that happens inside `leaveFederation` cannot reach it —
+/// only Dart can. Without this, leaving a federation leaves a foreground
+/// notification up and a relay subscription open for a wallet that is gone.
+///
+/// The stored pairing is deliberately left alone, matching the Rust side:
+/// re-joining and re-connecting starts the service again with the credentials
+/// the user already handed out.
+Future<void> stopNwcServiceForFederation(FederationId federationId) async {
+  if (!Platform.isAndroid) return;
+
+  try {
+    if (!await FlutterForegroundTask.isRunningService) return;
+
+    // The service records which federation it was started for, so a pairing on
+    // some other federation is left running.
+    final running = await FlutterForegroundTask.getData<String>(
+      key: 'federation_id',
+    );
+    final leaving = await federationIdToString(federationId: federationId);
+    if (running != leaving) return;
+
+    AppLogger.instance.info(
+      '[NWC] Stopping foreground service: its federation was left',
+    );
+    await FlutterForegroundTask.stopService();
+  } catch (e) {
+    // Never block leaving a federation on this. The federation is already gone
+    // from the wallet's point of view by the time we get here.
+    AppLogger.instance.error('[NWC] Could not stop foreground service: $e');
+  }
+}
+
 class NostrWalletConnect extends StatefulWidget {
   final List<(FederationSelector, bool)> federations;
 
@@ -130,44 +255,8 @@ class _NostrWalletConnectState extends State<NostrWalletConnect> {
         return;
       }
 
-      // Convert FederationId to string for passing to foreground task
-      final federationIdStr = await federationIdToString(
-        federationId: federation.federationId,
-      );
-
-      // Save data for the task handler
-      await FlutterForegroundTask.saveData(
-        key: 'federation_id',
-        value: federationIdStr,
-      );
-
-      // Initialize the service with Android notification options
-      FlutterForegroundTask.init(
-        androidNotificationOptions: AndroidNotificationOptions(
-          channelId: 'nwc_foreground_service',
-          channelName: context.l10n.nwcForegroundService,
-          channelDescription: context.l10n.nwcForegroundServiceDescription,
-          onlyAlertOnce: true,
-        ),
-        iosNotificationOptions: const IOSNotificationOptions(
-          showNotification: false,
-        ),
-        foregroundTaskOptions: ForegroundTaskOptions(
-          eventAction: ForegroundTaskEventAction.nothing(),
-        ),
-      );
-
-      await FlutterForegroundTask.startService(
-        serviceId: 256,
-        notificationTitle: context.l10n.nwcActive,
-        notificationText: context.l10n.nwcConnectedTo(
-          federation.federationName,
-        ),
-        notificationIcon: const NotificationIcon(
-          metaDataName: 'com.ecashapp.NOTIFICATION_ICON',
-        ),
-        callback: startNWCCallback,
-      );
+      if (!mounted) return;
+      await _launchNwcForegroundService(context, federation);
 
       AppLogger.instance.info('[NWC] Foreground service started successfully');
     }

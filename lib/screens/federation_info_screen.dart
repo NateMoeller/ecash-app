@@ -5,6 +5,7 @@ import 'package:ecashapp/screens/guardian_dashboard.dart';
 import 'package:ecashapp/widgets/federation_utxo_list.dart';
 import 'package:ecashapp/lib.dart';
 import 'package:ecashapp/multimint.dart';
+import 'package:ecashapp/nwc.dart';
 import 'package:ecashapp/providers/preferences_provider.dart';
 import 'package:ecashapp/toast.dart';
 import 'package:ecashapp/utils.dart';
@@ -279,6 +280,9 @@ class _FederationInfoScreenState extends State<FederationInfoScreen> {
                               await leaveFederation(
                                 federationId: _fed!.federationId,
                               );
+                              await stopNwcServiceForFederation(
+                                _fed!.federationId,
+                              );
                               try {
                                 backupInviteCodes();
                               } catch (e) {
@@ -450,6 +454,14 @@ class _FederationInfoScreenState extends State<FederationInfoScreen> {
         recover: recover,
       );
       AppLogger.instance.info('Successfully joined federation');
+
+      // A federation that was left and re-joined keeps its NWC pairing, so the
+      // listener has to be put back. Rust handles the desktop side inside
+      // `joinFederation`; the Android listener lives in the foreground service
+      // isolate, which only Dart can start.
+      if (mounted) {
+        await startNwcServiceIfPaired(context, fed);
+      }
 
       try {
         backupInviteCodes();

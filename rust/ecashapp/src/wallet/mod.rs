@@ -36,8 +36,8 @@ use crate::{
     event_bus::EventBus,
     get_event_bus, info_to_flutter,
     multimint::{
-        AwaitingConfsEvent, ClaimedEvent, ConfirmedEvent, DepositEventKind, MempoolEvent,
-        MultimintEvent, OnChainWithdrawalMeta, WithdrawFees, WithdrawFeesResponse,
+        AwaitingConfsEvent, ClaimedEvent, ConfirmedEvent, DepositEventKind, JoinedFederation,
+        MempoolEvent, MultimintEvent, OnChainWithdrawalMeta, WithdrawFees, WithdrawFeesResponse,
     },
     payment_error_to_flutter,
 };
@@ -67,6 +67,13 @@ pub(crate) struct WalletHandler {
     /// the block explorer independently and indefinitely. The startup rehydrate
     /// can overlap with a live poller for the same reason.
     watched_v2_addresses: Arc<RwLock<BTreeSet<(FederationId, String)>>>,
+    /// App-wide task group, for the dispatchers that outlive any one
+    /// federation.
+    ///
+    /// Per-federation work does not go here. Deposit watchers and pollers
+    /// belong to the federation that handed the address out, so they are
+    /// spawned on the [`JoinedFederation::tasks`] group their caller passes in
+    /// and are cancelled when that federation is left.
     task_group: TaskGroup,
 }
 
@@ -85,14 +92,32 @@ impl WalletHandler {
         }
     }
 
+    /// Drops the in-memory deposit-monitoring state belonging to a federation
+    /// the user has left.
+    ///
+    /// None of it is persisted — it is rebuilt from the client and from
+    /// [`WalletV2PendingDepositKey`] if the federation is joined again. Leaving
+    /// `watched_v2_addresses` populated would be actively harmful: the pollers
+    /// it names are being cancelled, but a re-join would read those addresses as
+    /// already watched and decline to start new ones.
+    pub(crate) async fn forget_federation(&self, federation_id: &FederationId) {
+        self.allocated_bitcoin_addresses
+            .write()
+            .await
+            .remove(federation_id);
+        self.watched_v2_addresses
+            .write()
+            .await
+            .retain(|(fed, _)| fed != federation_id);
+    }
+
     pub(crate) fn spawn_pegin_address_watcher(
         &self,
         mut monitor_rx: UnboundedReceiver<(FederationId, TweakIdx)>,
-        clients: Arc<RwLock<BTreeMap<FederationId, ClientHandleArc>>>,
+        clients: Arc<RwLock<BTreeMap<FederationId, JoinedFederation>>>,
     ) {
         let event_bus_clone = get_event_bus();
         let addresses_clone = self.allocated_bitcoin_addresses.clone();
-        let task_group_clone = self.task_group.clone();
 
         self.task_group
             .spawn_cancellable("pegin address watcher", async move {
@@ -105,7 +130,9 @@ impl WalletHandler {
                     // Skip that request and keep the loop alive; panicking here
                     // would take down deposit monitoring for every other
                     // federation too.
-                    let Some(client) = clients.read().await.get(&fed_id).cloned() else {
+                    let Some(JoinedFederation { client, tasks }) =
+                        clients.read().await.get(&fed_id).cloned()
+                    else {
                         info_to_flutter(format!(
                             "Skipping peg-in watch for {fed_id}: federation was left"
                         ))
@@ -113,8 +140,11 @@ impl WalletHandler {
                         continue;
                     };
 
+                    // Watching one address belongs to the federation that handed
+                    // it out, so it goes on that federation's group rather than
+                    // on this dispatcher's.
                     let addresses_clone = addresses_clone.clone();
-                    task_group_clone.spawn_cancellable("tweak index watcher", async move {
+                    tasks.spawn_cancellable("tweak index watcher", async move {
                         if let Err(e) = Self::watch_pegin_address(
                             fed_id,
                             client,
@@ -237,7 +267,7 @@ impl WalletHandler {
     ///   [`Self::resume_pending_v2_deposits`]).
     pub(crate) fn monitor_all_pending_deposits(
         &self,
-        clients: Arc<RwLock<BTreeMap<FederationId, ClientHandleArc>>>,
+        clients: Arc<RwLock<BTreeMap<FederationId, JoinedFederation>>>,
     ) {
         let handler = self.clone();
         let pegin_address_monitor_tx_clone = self.pegin_address_monitor_tx.clone();
@@ -246,12 +276,14 @@ impl WalletHandler {
         self.task_group
             .spawn_cancellable("pending deposit monitor", async move {
                 let clients_guard = clients.read().await;
-                for (fed_id, client) in clients_guard.iter() {
+                for (fed_id, JoinedFederation { client, tasks }) in clients_guard.iter() {
                     // walletv2 federations have no v1 wallet module and no tweak
                     // indices to scan; rehydrate their pollers from our persisted
                     // addresses instead.
                     let Ok(wallet_module) = client.get_first_module::<WalletClientModule>() else {
-                        handler.resume_pending_v2_deposits(*fed_id, client).await;
+                        handler
+                            .resume_pending_v2_deposits(tasks, *fed_id, client)
+                            .await;
                         continue;
                     };
 
@@ -312,6 +344,7 @@ impl WalletHandler {
 
     async fn monitor_deposit_address(
         &self,
+        tasks: &TaskGroup,
         federation_id: FederationId,
         address: String,
         client: ClientHandleArc,
@@ -332,7 +365,7 @@ impl WalletHandler {
             // from). The entry is removed once the deposit is claimed.
             self.persist_pending_v2_deposit(federation_id, &address)
                 .await;
-            self.spawn_v2_deposit_poller(federation_id, address, client)
+            self.spawn_v2_deposit_poller(tasks, federation_id, address, client)
                 .await;
             return Ok(None);
         }
@@ -404,6 +437,7 @@ impl WalletHandler {
 
     pub(crate) async fn allocate_deposit_address(
         &self,
+        tasks: &TaskGroup,
         federation_id: FederationId,
         client: ClientHandleArc,
     ) -> anyhow::Result<(String, Option<u64>)> {
@@ -422,7 +456,7 @@ impl WalletHandler {
         };
 
         let tweak_idx = self
-            .monitor_deposit_address(federation_id, address.clone(), client)
+            .monitor_deposit_address(tasks, federation_id, address.clone(), client)
             .await?;
 
         Ok((address, tweak_idx))
@@ -514,6 +548,7 @@ impl WalletHandler {
     /// instead of re-spawning it.
     async fn resume_pending_v2_deposits(
         &self,
+        tasks: &TaskGroup,
         federation_id: FederationId,
         client: &ClientHandleArc,
     ) {
@@ -552,7 +587,7 @@ impl WalletHandler {
                 "resume_pending_v2_deposits: resuming deposit poller for {address} on fed {federation_id}"
             ))
             .await;
-            self.spawn_v2_deposit_poller(federation_id, address, client.clone())
+            self.spawn_v2_deposit_poller(tasks, federation_id, address, client.clone())
                 .await;
         }
     }
@@ -567,6 +602,7 @@ impl WalletHandler {
     /// is doing it more than once per address, which is what this guards.
     async fn spawn_v2_deposit_poller(
         &self,
+        tasks: &TaskGroup,
         federation_id: FederationId,
         address: String,
         client: ClientHandleArc,
@@ -582,19 +618,17 @@ impl WalletHandler {
 
         let event_bus = get_event_bus();
         let watched = self.watched_v2_addresses.clone();
-        self.task_group
-            .spawn_cancellable("walletv2 deposit poller", async move {
-                if let Err(e) =
-                    Self::watch_v2_pegin_address(federation_id, address.clone(), client, event_bus)
-                        .await
-                {
-                    info_to_flutter(format!("watch_v2_pegin_address({address}) failed: {e:?}"))
-                        .await;
-                }
-                // Released on the way out so an address whose watcher ended
-                // without finding a deposit can be picked up again later.
-                watched.write().await.remove(&key);
-            });
+        tasks.spawn_cancellable("walletv2 deposit poller", async move {
+            if let Err(e) =
+                Self::watch_v2_pegin_address(federation_id, address.clone(), client, event_bus)
+                    .await
+            {
+                info_to_flutter(format!("watch_v2_pegin_address({address}) failed: {e:?}")).await;
+            }
+            // Released on the way out so an address whose watcher ended
+            // without finding a deposit can be picked up again later.
+            watched.write().await.remove(&key);
+        });
     }
 
     /// Polls esplora for an incoming deposit to a walletv2 receive address and
@@ -658,6 +692,7 @@ impl WalletHandler {
     /// carries the address rather than the on-chain outpoint.
     pub(crate) fn spawn_v2_deposit_event_listener(
         &self,
+        tasks: &TaskGroup,
         client: ClientHandleArc,
         federation_id: FederationId,
     ) {
@@ -667,153 +702,154 @@ impl WalletHandler {
         }
 
         let event_bus = get_event_bus();
-        let task_group = self.task_group.clone();
+        // The claim watchers this listener spawns belong to the same federation
+        // as the listener itself.
+        let task_group = tasks.clone();
         let db = self.db.clone();
         let mut log_event_added_rx = client.log_event_added_rx();
-        self.task_group
-            .spawn_cancellable("walletv2 deposit event listener", async move {
-                // Start at the end of the log so we only react to new events.
-                let mut position = client.get_next_event_log_id().await;
+        tasks.spawn_cancellable("walletv2 deposit event listener", async move {
+            // Start at the end of the log so we only react to new events.
+            let mut position = client.get_next_event_log_id().await;
 
-                info_to_flutter(format!(
-                    "spawn_v2_deposit_event_listener: started for fed {federation_id}, listening from log position {position:?}"
-                ))
-                .await;
+            info_to_flutter(format!(
+                "spawn_v2_deposit_event_listener: started for fed {federation_id}, listening from log position {position:?}"
+            ))
+            .await;
 
-                loop {
-                    if log_event_added_rx.changed().await.is_err() {
-                        info_to_flutter(format!(
-                            "spawn_v2_deposit_event_listener: log_event_added_rx closed for fed {federation_id}, stopping"
-                        ))
-                        .await;
-                        break;
+            loop {
+                if log_event_added_rx.changed().await.is_err() {
+                    info_to_flutter(format!(
+                        "spawn_v2_deposit_event_listener: log_event_added_rx closed for fed {federation_id}, stopping"
+                    ))
+                    .await;
+                    break;
+                }
+
+                let batch = client.get_event_log(Some(position), 100).await;
+                for event in &batch {
+                    position = event.id().saturating_add(1);
+
+                    // The "payment-receive" event kind is shared with lnv2,
+                    // so filter on the walletv2 module before decoding.
+                    if event.module_kind() != Some(&fedimint_walletv2_client::common::KIND)
+                        || event.kind != V2ReceivePaymentEvent::KIND
+                    {
+                        continue;
                     }
 
-                    let batch = client.get_event_log(Some(position), 100).await;
-                    for event in &batch {
-                        position = event.id().saturating_add(1);
+                    let Some(receive_event) = event.to_event::<V2ReceivePaymentEvent>() else {
+                        continue;
+                    };
 
-                        // The "payment-receive" event kind is shared with lnv2,
-                        // so filter on the walletv2 module before decoding.
-                        if event.module_kind() != Some(&fedimint_walletv2_client::common::KIND)
-                            || event.kind != V2ReceivePaymentEvent::KIND
-                        {
-                            continue;
-                        }
+                    let address = receive_event.address.assume_checked().to_string();
+                    let deposited_sats = receive_event.value.to_sat();
+                    let amount_msats = Amount::from_sats(deposited_sats).msats;
+                    let operation_id = receive_event.operation_id;
+                    let txid = receive_event.outpoint.map(|op| op.txid.to_string());
 
-                        let Some(receive_event) = event.to_event::<V2ReceivePaymentEvent>() else {
-                            continue;
-                        };
+                    info_to_flutter(format!(
+                        "spawn_v2_deposit_event_listener: ReceivePaymentEvent for fed {federation_id} address={address} amount={amount_msats} msats op={operation_id:?}, publishing Confirmed"
+                    ))
+                    .await;
 
-                        let address = receive_event.address.assume_checked().to_string();
-                        let deposited_sats = receive_event.value.to_sat();
-                        let amount_msats = Amount::from_sats(deposited_sats).msats;
-                        let operation_id = receive_event.operation_id;
-                        let txid = receive_event.outpoint.map(|op| op.txid.to_string());
-
-                        info_to_flutter(format!(
-                            "spawn_v2_deposit_event_listener: ReceivePaymentEvent for fed {federation_id} address={address} amount={amount_msats} msats op={operation_id:?}, publishing Confirmed"
-                        ))
+                    // The federation has recorded the deposit: persist the
+                    // amount so the address shows as funded (and is no longer
+                    // treated as pending) across restarts.
+                    Self::mark_v2_deposit_funded(&db, federation_id, &address, deposited_sats)
                         .await;
 
-                        // The federation has recorded the deposit: persist the
-                        // amount so the address shows as funded (and is no longer
-                        // treated as pending) across restarts.
-                        Self::mark_v2_deposit_funded(&db, federation_id, &address, deposited_sats)
-                            .await;
+                    // The federation has seen the confirmed deposit and is
+                    // claiming it.
+                    event_bus
+                        .publish(MultimintEvent::Deposit((
+                            federation_id,
+                            DepositEventKind::Confirmed(ConfirmedEvent {
+                                amount: amount_msats,
+                                outpoint: address.clone(),
+                                txid: txid.clone(),
+                            }),
+                        )))
+                        .await;
 
-                        // The federation has seen the confirmed deposit and is
-                        // claiming it.
-                        event_bus
-                            .publish(MultimintEvent::Deposit((
-                                federation_id,
-                                DepositEventKind::Confirmed(ConfirmedEvent {
-                                    amount: amount_msats,
-                                    outpoint: address.clone(),
-                                    txid: txid.clone(),
-                                }),
-                            )))
-                            .await;
-
-                        // Await the claim, then surface Claimed.
-                        let event_bus = event_bus.clone();
-                        let client = client.clone();
-                        task_group.spawn_cancellable("walletv2 await claim", async move {
-                            let Ok(wallet_module) = client.get_first_module::<WalletV2Module>()
-                            else {
-                                return;
-                            };
-                            match wallet_module
-                                .await_final_receive_operation_state(operation_id)
-                                .await
-                            {
-                                Ok(FinalReceiveOperationState::Success) => {
-                                    // Reaching `Success` only means the claim tx
-                                    // was accepted into consensus; the ecash it
-                                    // mints is issued asynchronously by the mint
-                                    // module. Wait for those outputs before
-                                    // surfacing Claimed so the balance reflects the
-                                    // deposit (the same step walletv2's own
-                                    // `await_receive` performs after success).
-                                    // Otherwise the dashboard refreshes its balance
-                                    // before the ecash lands and shows a stale
-                                    // value until the next manual refresh.
-                                    if let Some(op) =
-                                        client.operation_log().get_operation(operation_id).await
+                    // Await the claim, then surface Claimed.
+                    let event_bus = event_bus.clone();
+                    let client = client.clone();
+                    task_group.spawn_cancellable("walletv2 await claim", async move {
+                        let Ok(wallet_module) = client.get_first_module::<WalletV2Module>()
+                        else {
+                            return;
+                        };
+                        match wallet_module
+                            .await_final_receive_operation_state(operation_id)
+                            .await
+                        {
+                            Ok(FinalReceiveOperationState::Success) => {
+                                // Reaching `Success` only means the claim tx
+                                // was accepted into consensus; the ecash it
+                                // mints is issued asynchronously by the mint
+                                // module. Wait for those outputs before
+                                // surfacing Claimed so the balance reflects the
+                                // deposit (the same step walletv2's own
+                                // `await_receive` performs after success).
+                                // Otherwise the dashboard refreshes its balance
+                                // before the ecash lands and shows a stale
+                                // value until the next manual refresh.
+                                if let Some(op) =
+                                    client.operation_log().get_operation(operation_id).await
+                                {
+                                    if let WalletV2OperationMeta::Receive(receive) =
+                                        op.meta::<WalletV2OperationMeta>()
                                     {
-                                        if let WalletV2OperationMeta::Receive(receive) =
-                                            op.meta::<WalletV2OperationMeta>()
+                                        if let Err(e) = client
+                                            .await_primary_bitcoin_module_outputs(
+                                                operation_id,
+                                                receive
+                                                    .change_outpoint_range
+                                                    .into_iter()
+                                                    .collect(),
+                                            )
+                                            .await
                                         {
-                                            if let Err(e) = client
-                                                .await_primary_bitcoin_module_outputs(
-                                                    operation_id,
-                                                    receive
-                                                        .change_outpoint_range
-                                                        .into_iter()
-                                                        .collect(),
-                                                )
-                                                .await
-                                            {
-                                                info_to_flutter(format!(
-                                                    "walletv2 await primary module outputs error: {e:?}"
-                                                ))
-                                                .await;
-                                            }
+                                            info_to_flutter(format!(
+                                                "walletv2 await primary module outputs error: {e:?}"
+                                            ))
+                                            .await;
                                         }
                                     }
+                                }
 
-                                    info_to_flutter(format!(
-                                        "spawn_v2_deposit_event_listener: receive op {operation_id:?} succeeded for fed {federation_id} address={address}, publishing Claimed"
-                                    ))
+                                info_to_flutter(format!(
+                                    "spawn_v2_deposit_event_listener: receive op {operation_id:?} succeeded for fed {federation_id} address={address}, publishing Claimed"
+                                ))
+                                .await;
+                                event_bus
+                                    .publish(MultimintEvent::Deposit((
+                                        federation_id,
+                                        DepositEventKind::Claimed(ClaimedEvent {
+                                            amount: amount_msats,
+                                            outpoint: address,
+                                            txid,
+                                        }),
+                                    )))
                                     .await;
-                                    event_bus
-                                        .publish(MultimintEvent::Deposit((
-                                            federation_id,
-                                            DepositEventKind::Claimed(ClaimedEvent {
-                                                amount: amount_msats,
-                                                outpoint: address,
-                                                txid,
-                                            }),
-                                        )))
-                                        .await;
-                                }
-                                Ok(state) => {
-                                    info_to_flutter(format!(
-                                        "walletv2 receive ended in non-success state: {state:?}"
-                                    ))
-                                    .await;
-                                }
-                                Err(e) => {
-                                    info_to_flutter(format!(
-                                        "walletv2 await receive error: {e:?}"
-                                    ))
-                                    .await;
-                                }
                             }
-                        });
-                    }
+                            Ok(state) => {
+                                info_to_flutter(format!(
+                                    "walletv2 receive ended in non-success state: {state:?}"
+                                ))
+                                .await;
+                            }
+                            Err(e) => {
+                                info_to_flutter(format!(
+                                    "walletv2 await receive error: {e:?}"
+                                ))
+                                .await;
+                            }
+                        }
+                    });
                 }
-            });
+            }
+        });
     }
 
     // ---- On-chain send (peg-out) ----------------------------------------
@@ -1137,7 +1173,7 @@ fn mempool_api_url(network: bitcoin::Network) -> String {
         bitcoin::Network::Bitcoin => "https://mempool.space/api".to_string(),
         bitcoin::Network::Signet => "https://mutinynet.com/api".to_string(),
         bitcoin::Network::Regtest => {
-            "http://127.0.0.1:15641".to_string()
+            "http://127.0.0.1:16249".to_string()
             //panic!("Regtest requires manually setting the connection params")
         }
         network => {
