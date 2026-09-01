@@ -1032,32 +1032,54 @@ impl Multimint {
                 .map(Arc::new)?;
 
             let tasks = self.task_group.make_subgroup();
+            // A client reopened mid-recovery gets replaced the moment that
+            // recovery finishes, so everything holding it goes on a child group
+            // that `wait_for_recovery` can retire — see `join_federation_inner`.
+            let recovering = client.has_pending_recoveries();
+            let client_tasks = if recovering {
+                tasks.make_subgroup()
+            } else {
+                tasks.clone()
+            };
+
             self.register_federation(id.id, client.clone(), tasks.clone())
                 .await;
 
-            self.spawn_lnv2_event_listener(&tasks, client.clone(), id.id);
-            self.wallet_handler
-                .spawn_v2_deposit_event_listener(&tasks, client.clone(), id.id);
-            self.finish_active_subscriptions(&tasks, client.clone(), id.id);
-            if client.has_pending_recoveries() {
-                self.spawn_recovery_progress(&tasks, client.clone());
+            self.spawn_lnv2_event_listener(&client_tasks, client.clone(), id.id);
+            self.wallet_handler.spawn_v2_deposit_event_listener(
+                &client_tasks,
+                client.clone(),
+                id.id,
+            );
+            self.finish_active_subscriptions(&tasks, &client_tasks, client.clone(), id.id);
+            if recovering {
+                self.spawn_recovery_progress(&tasks, &client_tasks, client.clone());
             }
 
-            self.lnv1_update_gateway_cache(&tasks, &client);
+            self.lnv1_update_gateway_cache(&client_tasks, &client);
         }
 
         Ok(())
     }
 
+    /// Re-drives operations that were still in flight when the app last closed.
+    ///
+    /// Two groups because the scan and what it starts have different lifetimes.
+    /// The scan reads `client`'s operation log and so belongs to that client,
+    /// on `client_tasks`. The monitors it spawns resolve the client by
+    /// federation id when they run, so they belong to the federation and go on
+    /// `tasks` — which keeps them alive across a recovery client being retired
+    /// and replaced. For every non-recovering client the two are the same group.
     fn finish_active_subscriptions(
         &self,
         tasks: &TaskGroup,
+        client_tasks: &TaskGroup,
         client: ClientHandleArc,
         federation_id: FederationId,
     ) {
         let self_copy = self.clone();
         let tasks_copy = tasks.clone();
-        tasks.spawn_cancellable("finish active subscriptions", async move {
+        client_tasks.spawn_cancellable("finish active subscriptions", async move {
             let active_operations = client.get_active_operations().await;
             let operation_log = client.operation_log();
             for op_id in active_operations {
@@ -2038,34 +2060,42 @@ impl Multimint {
         let invite_code = InviteCode::from_str(&invite)?;
         let federation_id = invite_code.federation_id();
 
-        // Created before the client, not after: `build_client` spawns the
-        // recovery watchers while the client is still a local, and those belong
-        // to this federation like every other task.
-        //
         // An already-joined federation keeps the group it has rather than
-        // getting a fresh one. `wait_for_recovery` runs *on* that group and
-        // re-joins the very federation it is recovering, so handing this join a
-        // new group would strand the recovery task on an orphaned one — and
-        // cancelling the old group here would kill the call that is running
-        // this code.
+        // getting a fresh one, so that tasks belonging to it are never split
+        // across two groups.
         let existing = self
             .clients
             .read()
             .await
             .get(&federation_id)
             .map(|joined| joined.tasks.clone());
-        let is_rejoin = existing.is_some();
+        let minted_tasks = existing.is_none();
         let tasks = existing.unwrap_or_else(|| self.task_group.make_subgroup());
 
+        self.join_federation_on(invite_code, recover, tasks, minted_tasks)
+            .await
+    }
+
+    /// Joins onto a task group chosen by the caller.
+    ///
+    /// `minted_tasks` says whether that group was created for this join, and so
+    /// whether a failed join should shut it down. The recovery re-join passes
+    /// `false`: it hands over the group it took from the federation it just
+    /// retired, and `wait_for_recovery` is itself running on that group.
+    async fn join_federation_on(
+        &mut self,
+        invite_code: InviteCode,
+        recover: bool,
+        tasks: TaskGroup,
+        minted_tasks: bool,
+    ) -> anyhow::Result<FederationSelector> {
+        let federation_id = invite_code.federation_id();
         let result = self
             .join_federation_inner(federation_id, invite_code, recover, &tasks)
             .await;
 
         if result.is_err() {
-            // Only tear down a group this call minted. On a re-join the group
-            // belongs to the federation that is still joined, and its tasks are
-            // still wanted.
-            if !is_rejoin {
+            if minted_tasks {
                 tasks.shutdown();
             }
             return result;
@@ -2090,13 +2120,28 @@ impl Multimint {
         recover: bool,
         tasks: &TaskGroup,
     ) -> anyhow::Result<FederationSelector> {
-        let client = if recover {
-            self.build_client(&federation_id, &invite_code, ClientType::Recovery, tasks)
-                .await?
+        // Everything that holds *this particular client* goes on `client_tasks`.
+        //
+        // For a recovery join that is a child of the federation's group, because
+        // this client is temporary: `wait_for_recovery` opens a replacement over
+        // the same client database once recovery finishes, and it has to be able
+        // to retire this one — watchers and all — before it does. For every
+        // other join the client lives as long as the federation does, so the two
+        // groups are the same.
+        let client_tasks = if recover {
+            tasks.make_subgroup()
         } else {
-            self.build_client(&federation_id, &invite_code, ClientType::New, tasks)
-                .await?
+            tasks.clone()
         };
+
+        let client_type = if recover {
+            ClientType::Recovery
+        } else {
+            ClientType::New
+        };
+        let client = self
+            .build_client(&federation_id, &invite_code, client_type, &client_tasks)
+            .await?;
 
         let client_config = client.config().await;
         let federation_name = client_config
@@ -2117,9 +2162,16 @@ impl Multimint {
         self.register_federation(federation_id, client.clone(), tasks.clone())
             .await;
 
-        self.wallet_handler
-            .spawn_v2_deposit_event_listener(tasks, client.clone(), federation_id);
-        self.spawn_lnv2_event_listener(tasks, client, federation_id);
+        self.wallet_handler.spawn_v2_deposit_event_listener(
+            &client_tasks,
+            client.clone(),
+            federation_id,
+        );
+        self.spawn_lnv2_event_listener(&client_tasks, client.clone(), federation_id);
+
+        if recover {
+            self.spawn_recovery_progress(tasks, &client_tasks, client);
+        }
 
         let mut dbtx = self.db.begin_transaction().await;
         dbtx.insert_entry(
@@ -2248,6 +2300,52 @@ impl Multimint {
             });
     }
 
+    /// Retires a finished recovery client, returning the federation's task group
+    /// so the replacement can be registered back onto it.
+    ///
+    /// Shuts down everything that holds the client, then takes the federation
+    /// out of the map — which drops the map's handle and leaves this call the
+    /// sole owner — and shuts the client itself down. Only then is it safe to
+    /// open the replacement over the same client database.
+    ///
+    /// The federation has no client for as long as the shutdown and the re-open
+    /// take, a fraction of a second at the tail of a recovery that has already
+    /// run for seconds. `federations()` skips a config whose client is missing,
+    /// so it is briefly absent from the list rather than half-present. If the
+    /// re-join then fails, the caller's error surfaces through
+    /// `spawn_recovery_progress` and the federation is left with its config but
+    /// no client until the next launch, which `load_clients` repairs.
+    async fn retire_recovery_client(
+        &self,
+        federation_id: FederationId,
+        client_tasks: TaskGroup,
+        recovering_client: ClientHandleArc,
+    ) -> anyhow::Result<TaskGroup> {
+        if let Err(e) = client_tasks
+            .shutdown_join_all(LEAVE_TASK_JOIN_TIMEOUT)
+            .await
+        {
+            info_to_flutter(format!(
+                "Recovery watchers for {federation_id} did not all stop cleanly: {e}"
+            ))
+            .await;
+        }
+
+        let Some(JoinedFederation { tasks, .. }) =
+            self.clients.write().await.remove(&federation_id)
+        else {
+            bail!("Federation {federation_id} was left while its recovery was finishing");
+        };
+
+        Self::shutdown_client(federation_id, recovering_client).await;
+        info_to_flutter(format!(
+            "Retired the recovery client for {federation_id}; reopening"
+        ))
+        .await;
+
+        Ok(tasks)
+    }
+
     /// Shuts a left federation's client down, so the client's own executor and
     /// task group stop along with ours.
     ///
@@ -2334,7 +2432,6 @@ impl Multimint {
                     )
                     .await
                     .map(Arc::new)?;
-                self.spawn_recovery_progress(tasks, client.clone());
                 client
             }
             client_type => {
@@ -2389,17 +2486,29 @@ impl Multimint {
     /// non-`async` function keeps the spawned future's `Send` obligation out of
     /// `build_client`'s own, which is what stops that cycle from becoming an
     /// unsolvable auto-trait bound.
-    fn spawn_recovery_progress(&self, tasks: &TaskGroup, client: ClientHandleArc) {
+    fn spawn_recovery_progress(
+        &self,
+        tasks: &TaskGroup,
+        client_tasks: &TaskGroup,
+        client: ClientHandleArc,
+    ) {
         let mut self_copy = self.clone();
         let recovering_client = client.clone();
+        let client_tasks_copy = client_tasks.clone();
+        // On the federation's group rather than the client's: this is the task
+        // that retires the recovery client, so it has to outlive it.
         tasks.spawn_cancellable("wait for recovery", async move {
-            if let Err(e) = self_copy.wait_for_recovery(recovering_client).await {
+            if let Err(e) = self_copy
+                .wait_for_recovery(client_tasks_copy, recovering_client)
+                .await
+            {
                 error_to_flutter(format!("Error waiting for recovery: {e:?}")).await;
             }
         });
 
         let progress_copy = self.clone();
-        tasks.spawn_cancellable("recovery progress", async move {
+        // On the client's group: it streams that client's progress and holds it.
+        client_tasks.spawn_cancellable("recovery progress", async move {
             progress_copy
                 .init_recovery_progress_cache(client.federation_id())
                 .await;
@@ -2492,27 +2601,40 @@ impl Multimint {
 
     async fn wait_for_recovery(
         &mut self,
+        client_tasks: TaskGroup,
         recovering_client: ClientHandleArc,
     ) -> anyhow::Result<()> {
         let federation_id = recovering_client.federation_id();
         info_to_flutter("Waiting for all recoveries...").await;
         recovering_client.wait_for_all_recoveries().await?;
 
-        // Try all federation invite codes in case some peers are down
+        // Pick an invite code while the recovery client is still up — it is the
+        // only thing that knows the peers' codes, and it is about to be retired.
+        // Try them all in case some peers are down.
         let config = recovering_client.config().await;
-        let peers = config.global.api_endpoints.keys().collect::<Vec<_>>();
-        let mut joined = false;
-        for peer in peers {
-            if let Some(invite_code) = recovering_client.invite_code(*peer).await {
-                self.join_federation(invite_code.to_string(), false).await?;
-                joined = true;
+        let mut invite_code = None;
+        for peer in config.global.api_endpoints.keys() {
+            if let Some(code) = recovering_client.invite_code(*peer).await {
+                invite_code = Some(code);
                 break;
             }
         }
-
-        if !joined {
+        let Some(invite_code) = invite_code else {
             bail!("Could not re-join federation after recovering");
-        }
+        };
+
+        // Retire this client *before* opening its replacement, never after. The
+        // two would be views of the same client database — `with_prefix` is a
+        // key namespace, not a separate database — so both would commit to the
+        // same keys, and fedimint's best-effort background writers (the cached
+        // API version set among them) use the non-retrying `commit_tx`, which
+        // panics on the resulting `WriteConflict` instead of backing off.
+        let tasks = self
+            .retire_recovery_client(federation_id, client_tasks, recovering_client)
+            .await?;
+
+        self.join_federation_on(invite_code, false, tasks, false)
+            .await?;
 
         let new_client = self
             .clients
