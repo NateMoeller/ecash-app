@@ -62,6 +62,7 @@ class MainActivity : FlutterActivity() {
                 addDataScheme("lnurl")
                 addDataScheme("bitcoin")
                 addDataScheme("lnurlp")
+                addDataScheme("lnurlw")
             },
         )
 

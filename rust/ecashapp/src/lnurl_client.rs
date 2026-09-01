@@ -334,14 +334,20 @@ fn build_withdraw_callback_url(callback: &str, k1: &str, invoice: &str) -> Strin
 /// Convert an `lnurlw://` URI to its `http(s)://` equivalent (LUD-17).
 /// Local hosts and `.onion` addresses use plain `http`; everything else uses `https`.
 pub(crate) fn withdraw_uri_to_http(uri: &str) -> Option<String> {
-    // Must start with the lnurlw scheme (case-insensitive).
-    let rest = uri.strip_prefix("lnurlw://")?;
+    // Must start with the lnurlw scheme (case-insensitive). `get` rather than a
+    // slice so a multi-byte char straddling the prefix returns None, not a panic.
+    const PREFIX: &str = "lnurlw://";
+    if !uri.get(..PREFIX.len())?.eq_ignore_ascii_case(PREFIX) {
+        return None;
+    }
+    let rest = &uri[PREFIX.len()..];
     // Extract host (everything before the first '/' or '?').
     let host = rest.split(['/', '?']).next().unwrap_or(rest);
-    // Strip port if present.
-    let host_no_port = host.split(':').next().unwrap_or(host);
+    // Strip port if present. Hosts are case-insensitive, so compare lowercased.
+    let host_no_port = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
     const LOCAL_HOSTS: &[&str] = &["localhost", "127.0.0.1", "10.0.2.2"];
-    let scheme = if host_no_port.ends_with(".onion") || LOCAL_HOSTS.contains(&host_no_port) {
+    let scheme = if host_no_port.ends_with(".onion") || LOCAL_HOSTS.contains(&host_no_port.as_str())
+    {
         "http"
     } else {
         "https"
@@ -651,5 +657,23 @@ mod tests {
     fn withdraw_uri_to_http_wrong_scheme_returns_none() {
         assert!(withdraw_uri_to_http("lnurl://example.com/withdraw").is_none());
         assert!(withdraw_uri_to_http("https://example.com/withdraw").is_none());
+    }
+
+    #[test]
+    fn withdraw_uri_to_http_uppercase_scheme_is_accepted() {
+        let result = withdraw_uri_to_http("LNURLW://Pay.Example.com/w?k1=abc");
+        assert_eq!(result, Some("https://Pay.Example.com/w?k1=abc".to_string()));
+    }
+
+    #[test]
+    fn withdraw_uri_to_http_uppercase_local_host_uses_http() {
+        let result = withdraw_uri_to_http("LNURLW://LOCALHOST:8080/w?k1=abc");
+        assert_eq!(result, Some("http://LOCALHOST:8080/w?k1=abc".to_string()));
+    }
+
+    #[test]
+    fn withdraw_uri_to_http_short_input_returns_none() {
+        assert!(withdraw_uri_to_http("lnurlw:").is_none());
+        assert!(withdraw_uri_to_http("").is_none());
     }
 }

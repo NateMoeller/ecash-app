@@ -109,23 +109,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
               );
             },
           ),
-          _SettingsOption(
-            icon: Icon(
-              Icons.link,
-              color: Theme.of(context).colorScheme.primary,
+          // Hidden where no NWC listener can run, rather than offered and left
+          // to fail silently: pairing hands out remote spending authority, and
+          // a pairing nothing is listening for is worse than none. See
+          // [nwcSupported].
+          if (nwcSupported)
+            _SettingsOption(
+              icon: Icon(
+                Icons.link,
+                color: Theme.of(context).colorScheme.primary,
+              ),
+              title: context.l10n.nostrWalletConnect,
+              subtitle: context.l10n.nostrWalletConnectSubtitle,
+              onTap: () async {
+                final feds = await federations();
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => NostrWalletConnect(federations: feds),
+                  ),
+                );
+              },
             ),
-            title: context.l10n.nostrWalletConnect,
-            subtitle: context.l10n.nostrWalletConnectSubtitle,
-            onTap: () async {
-              final feds = await federations();
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (context) => NostrWalletConnect(federations: feds),
-                ),
-              );
-            },
-          ),
           _SettingsOption(
             icon: Image.asset(
               'assets/images/nostr.png',

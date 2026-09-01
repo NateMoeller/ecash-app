@@ -54,14 +54,12 @@ pub async fn parse_text<C: ParseContext + ?Sized>(
 ) -> anyhow::Result<(ParsedText, Option<FederationSelector>)> {
     // LUD-17: lnurlw:// is a raw-scheme Boltcard / LNURL-withdraw URI.
     // Convert to http(s) and return immediately — no balance needed (receive flow).
-    if text.to_lowercase().starts_with("lnurlw://") {
-        if let Some(url) = crate::lnurl_client::withdraw_uri_to_http(&text) {
-            let fed = match &selected {
-                Some(f) => Some(f.clone()),
-                None => ctx.federations().await.into_iter().next(),
-            };
-            return Ok((ParsedText::LnurlWithdraw(url), fed));
-        }
+    if let Some(url) = crate::lnurl_client::withdraw_uri_to_http(&text) {
+        let fed = match &selected {
+            Some(f) => Some(f.clone()),
+            None => ctx.federations().await.into_iter().next(),
+        };
+        return Ok((ParsedText::LnurlWithdraw(url), fed));
     }
 
     if selected.is_none() && InviteCode::from_str(&text).is_ok() {
