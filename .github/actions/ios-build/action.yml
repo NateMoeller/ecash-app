@@ -9,9 +9,9 @@ inputs:
     required: false
     default: "false"
   xcode-version:
-    description: "Xcode version to select. Empty uses the runner image default, matching macos-release.yml."
+    description: "Xcode version to select. A major-version range, so runner image updates inside that major are picked up but a new major is not."
     required: false
-    default: ""
+    default: "^26.0"
   bundle-id:
     description: "Bundle identifier the provisioning profile is issued for"
     required: false
@@ -43,10 +43,17 @@ outputs:
 runs:
   using: "composite"
   steps:
-    # Optional pin. Left empty by default so this tracks the runner image's
-    # default Xcode, the same as macos-release.yml. setup-xcode works by
-    # exporting DEVELOPER_DIR, which scripts/build-rust-ios.sh honors now that it
-    # no longer hardcodes the path inside its `env -i` re-exec.
+    # Pinned to a major, not left to the runner image, because the SDK is
+    # load-bearing here: rust/ecashapp/src/ios_compat.rs exists solely to define
+    # nw_path_is_ultra_constrained, which netdev calls unconditionally and Apple
+    # only ships in the iOS 26 SDK. A runner image rolling to a new major Xcode
+    # would silently change what the shipping binary links against, and the
+    # failure mode is an app that will not launch below the new deployment
+    # floor. `^26.0` still picks up 26.x image updates.
+    #
+    # setup-xcode works by exporting DEVELOPER_DIR, which
+    # scripts/build-rust-ios.sh honors now that it no longer hardcodes the path
+    # inside its `env -i` re-exec.
     - name: Select Xcode
       if: inputs.xcode-version != ''
       uses: maxim-lobanov/setup-xcode@v1
@@ -87,17 +94,37 @@ runs:
     # explicitly. Placed after the toolchain install because the cache key
     # includes the rustc version.
     #
-    # save-if is the one deliberate difference. The iOS target directory is
-    # multiple GB and the repo-wide Actions cache budget is 10 GB, already shared
-    # with checks.yml, both android-build keys and macos-release. Letting every
-    # pull request write an entry would evict the rest; pull requests read the
-    # cache, only master and tags refresh it.
+    # shared-key, not key: `key` leaves rust-cache's default job-id segment in
+    # place, which filed master's entry under ios-release-*build* and sent the
+    # tag job looking for ios-release-*testflight*. The one build that matters
+    # most was therefore always cold. shared-key drops that segment, so the tag
+    # job restores what master saved.
+    #
+    # Every ref saves, deliberately. Actions cache scoping means only entries
+    # written on the default branch are visible to all pull requests, and master
+    # builds release, so restricting saves to master left every pull request
+    # cold: the debug key had no writer. Letting pull requests write their own
+    # makes the push / fix / push loop warm from the second push onward, which
+    # is the loop that actually happens. A pull request's first push is still
+    # cold and cannot be fixed here — that would take a debug build on master,
+    # i.e. a second 10x-billed macOS job per merge.
+    #
+    # The cost is cache budget: an iOS entry runs 1-2.5 GB against a 10 GB
+    # repo-wide limit already shared with checks.yml, both android-build keys
+    # and macos-release. Eviction is least-recently-used, so several concurrent
+    # iOS pull requests will start displacing other workflows' entries. That is
+    # the knob to turn back if Android or checks start rebuilding from scratch.
+    #
+    # cache-on-failure because the loop above depends on it: rust-cache skips
+    # saving on a failed job by default, and a run that compiled all of Rust and
+    # then died in flutter/xcodebuild is precisely the run whose target
+    # directory is worth keeping.
     - name: Cache Rust build
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: rust/ecashapp
-        key: ios-${{ inputs.mode }}
-        save-if: ${{ github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/') }}
+        shared-key: ios-${{ inputs.mode }}
+        cache-on-failure: true
 
     - name: Cache Flutter pub
       uses: actions/cache@v4
@@ -207,9 +234,19 @@ runs:
     # Rewrites ios/Flutter/Generated.xcconfig and runs pod install. Has to come
     # after the Rust build, because pod install reads the xcconfigs that reference
     # the static library. See the comment in scripts/run-ios-device.sh.
+    #
+    # --no-codesign is required even though this signs nothing. Flutter resolves
+    # a signing identity before honoring --config-only, and short-circuits only
+    # when DEVELOPMENT_TEAM is already in the resolved build settings. On the
+    # unsigned path there is no Local.xcconfig to supply one, so it falls through
+    # to `security find-identity` against an empty runner keychain and exits 1.
+    # Nothing is lost on the signed path either: the identity it would resolve is
+    # passed as an xcodebuild argument, and --config-only never invokes a build.
+    # Archive signing comes from Local.xcconfig plus ExportOptions.plist during
+    # `flutter build ipa` below.
     - name: Configure iOS project
       shell: bash
-      run: flutter build ios --config-only --${{ inputs.mode }}
+      run: flutter build ios --config-only --${{ inputs.mode }} --no-codesign
 
     - name: Compute version
       if: inputs.with-signing == 'true'
@@ -247,11 +284,12 @@ runs:
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         <plist version="1.0">
         <dict>
-          <!-- Xcode 15.3 renamed this value to "app-store-connect" but still
-               accepts "app-store"; older Xcode accepts only "app-store", and it
-               is also the value flutter's own --export-method uses. -->
+          <!-- "app-store-connect" since Xcode 15.3; the "app-store" spelling it
+               replaced is still accepted but deprecated. Safe to use the current
+               name because xcode-version pins a major above that. Revisit if
+               that pin is ever moved below 15.3. -->
           <key>method</key>
-          <string>app-store</string>
+          <string>app-store-connect</string>
           <key>teamID</key>
           <string>${{ inputs.team-id }}</string>
           <key>signingStyle</key>
