@@ -51,14 +51,25 @@ runs:
     # failure mode is an app that will not launch below the new deployment
     # floor. `^26.0` still picks up 26.x image updates.
     #
-    # setup-xcode works by exporting DEVELOPER_DIR, which
-    # scripts/build-rust-ios.sh honors now that it no longer hardcodes the path
-    # inside its `env -i` re-exec.
+    # setup-xcode pins by running `xcode-select -s`; it does not export
+    # DEVELOPER_DIR. That is enough for xcodebuild and flutter, but not for
+    # scripts/build-rust-ios.sh: its `env -i` re-exec drops everything, and with
+    # DEVELOPER_DIR unset it falls back to /Applications/Xcode.app — a symlink
+    # to the image default that `xcode-select -s` does not move. The Rust link
+    # path would therefore follow the runner image while everything else
+    # followed the pin. Exporting the selected path closes that gap, and
+    # build-rust-ios.sh forwards it once it validates as a real iOS-capable
+    # Xcode.
     - name: Select Xcode
       if: inputs.xcode-version != ''
       uses: maxim-lobanov/setup-xcode@v1
       with:
         xcode-version: ${{ inputs.xcode-version }}
+
+    - name: Export the selected Xcode
+      if: inputs.xcode-version != ''
+      shell: bash
+      run: echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
 
     # macOS arm64 runners ship ~14 GB of free disk, and rust/ecashapp/target for
     # the fedimint tree plus an ~800 MB - 1.6 GB libecashapp.a gets close to it.
